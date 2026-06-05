@@ -3,6 +3,8 @@ const healthColor = {
   Good: "#88ff00",
   Fair: "#ffcc00",
   Poor: "#ff3333",
+  Offline: "#666",
+  Unknown: "#888",
 };
 
 export default function SignalHUD({ data, connected }) {
@@ -27,6 +29,16 @@ export default function SignalHUD({ data, connected }) {
     );
   }
 
+  if (!data.linkUp) {
+    return (
+      <div style={styles.container}>
+        <div style={styles.title}>Wi-Fi Signal Visualizer</div>
+        <div style={styles.offline}>No active Wi-Fi link</div>
+        <div style={styles.sub}>Connect to a network to see terrain</div>
+      </div>
+    );
+  }
+
   const color = healthColor[data.health] || "#ffffff";
 
   return (
@@ -40,7 +52,14 @@ export default function SignalHUD({ data, connected }) {
 
       <div style={styles.row}>
         <span style={styles.label}>Signal</span>
-        <span style={{ ...styles.value, color }}>{data.rssi} dBm</span>
+        <span style={{ ...styles.value, color }}>
+          {data.rssi} dBm
+          {data.rssiSource === "scan" && (
+            <span style={styles.fromScan} title="Backfilled from scan (run as root for live RSSI)">
+              ~scan
+            </span>
+          )}
+        </span>
       </div>
 
       <div style={styles.row}>
@@ -143,10 +162,22 @@ const styles = {
     color: "#aaa",
     fontSize: 14,
   },
+  offline: {
+    color: "#ff6666",
+    fontSize: 14,
+    fontWeight: 600,
+    marginBottom: 6,
+  },
   sub: {
     color: "#999",
     fontSize: 11,
     marginTop: 6,
+    fontWeight: 400,
+  },
+  fromScan: {
+    fontSize: 10,
+    color: "#888",
+    marginLeft: 6,
     fontWeight: 400,
   },
 };
