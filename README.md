@@ -52,14 +52,20 @@ React UI in your browser.
 
 ## macOS privilege note
 
-Modern macOS only returns live `rssiValue()` and `noiseMeasurement()` to
-processes running as root. Without sudo the iface reports 0, and the server
-back-fills RSSI from the latest scan (you'll see a `~scan` badge next to the
-signal in the HUD). For a live, sub-second link reading:
+Since macOS Big Sur, live `rssiValue()` and `noiseMeasurement()` are gated
+on either:
 
-```bash
-sudo python3 server.py
-```
+1. **Location Services permission** for the terminal app (preferred for
+   day-to-day use). Open **System Settings → Privacy & Security → Location
+   Services**, scroll down, and enable Location for Terminal or iTerm. No
+   restart needed.
+2. **Running the server as root** (`sudo python3 server.py`).
+
+Without either, the iface reports rssi=0. The server back-fills from the
+latest scan when it can match by SSID — you'll see a `~scan` badge next to
+the signal value in the terrain HUD. If the connected SSID is also hidden,
+the link RSSI shows as "Unknown" rather than risk picking a neighbouring
+AP's RSSI on the same channel.
 
 The mesh view works either way — `scanForNetworksWithName_error_` does not
 require elevation.

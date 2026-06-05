@@ -2,9 +2,14 @@ import { useEffect, useMemo, useRef, useState, memo } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Text, Billboard, Line } from "@react-three/drei";
 import * as THREE from "three";
+import {
+  ARENA_RADIUS,
+  rssiToDistance,
+  trilaterate,
+  median,
+} from "../utils/trilateration";
 
 // ── Layout / tuning ─────────────────────────────────────────────────────
-const ARENA_RADIUS = 6;
 const LERP_FACTOR = 0.12;
 const MIN_REACH = 0.5;
 const MAX_REACH = 4.0;
@@ -15,17 +20,12 @@ const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 const RSSI_FILTER_SIZE = 7;
 const SMOOTH_ALPHA = 0.25;
 const MAX_STEP = 0.5;
-const MIN_USER_DIST = 0.8;
 
 // Heatmap
 const HEATMAP_SIZE = 20;
 const HEATMAP_RES = 40;
 const HEATMAP_CELL = HEATMAP_SIZE / HEATMAP_RES;
 const HEATMAP_SAMPLE_INTERVAL = 10;
-
-// Path-loss model — see https://en.wikipedia.org/wiki/Log-distance_path_loss_model
-const PATH_LOSS_REF_RSSI = -40;
-const PATH_LOSS_EXPONENT = 2.7;
 
 const PALETTE = [
   "#ff6b6b", "#4ecdc4", "#45b7d1", "#96ceb4", "#ffeaa7",
@@ -46,10 +46,6 @@ function colorFor(id) {
   return PALETTE[hashString(id) % PALETTE.length];
 }
 
-function rssiToDistance(rssi, ref = PATH_LOSS_REF_RSSI, n = PATH_LOSS_EXPONENT) {
-  return Math.pow(10, (ref - rssi) / (10 * n));
-}
-
 function rssiToReach(rssi) {
   const t = Math.max(0, Math.min(1, (rssi + 95) / 65));
   return MIN_REACH + t * (MAX_REACH - MIN_REACH);
@@ -66,111 +62,6 @@ function rssiToColor(rssi) {
     _tempColor.setRGB(0, 1.0, (t - 0.66) * 3);
   }
   return _tempColor;
-}
-
-function median(arr) {
-  if (arr.length === 0) return 0;
-  const sorted = [...arr].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-// ── Trilateration ───────────────────────────────────────────────────────
-// Linear least squares against the path-loss model. With N>=3 we solve the
-// linearised system anchored on the strongest AP; with N==2 we use a weighted
-// midpoint biased toward the stronger one; with N==1 we project from the AP
-// along the previous heading. Output is clamped to the arena.
-function trilaterate(nodes, prev) {
-  if (nodes.length === 0) return [0, 0.5, 0];
-
-  const sorted = [...nodes].sort((a, b) => b.rssi - a.rssi);
-
-  if (sorted.length === 1) {
-    return projectFromSingle(sorted[0], prev);
-  }
-  if (sorted.length === 2) {
-    return weightedMidpoint(sorted[0], sorted[1]);
-  }
-  return leastSquares(sorted) ?? centroid(sorted);
-}
-
-function projectFromSingle(node, prev) {
-  const d = rssiToDistance(node.rssi) * 0.5;
-  const scaled = Math.max(MIN_USER_DIST, Math.min(ARENA_RADIUS * 0.7, d));
-  let dirX = prev[0] - node.pos[0];
-  let dirZ = prev[2] - node.pos[2];
-  let len = Math.sqrt(dirX * dirX + dirZ * dirZ);
-  if (len < 0.1) {
-    dirX = -node.pos[0];
-    dirZ = -node.pos[2];
-    len = Math.sqrt(dirX * dirX + dirZ * dirZ);
-    if (len < 0.01) { dirX = 1; dirZ = 0; len = 1; }
-  }
-  return [
-    node.pos[0] + (dirX / len) * scaled,
-    0.5,
-    node.pos[2] + (dirZ / len) * scaled,
-  ];
-}
-
-function weightedMidpoint(a, b) {
-  const wa = Math.max(1, a.rssi + 100);
-  const wb = Math.max(1, b.rssi + 100);
-  const w = wa + wb;
-  return [
-    (a.pos[0] * wa + b.pos[0] * wb) / w,
-    0.5,
-    (a.pos[2] * wa + b.pos[2] * wb) / w,
-  ];
-}
-
-function centroid(nodes) {
-  let wx = 0, wz = 0, wSum = 0;
-  for (const n of nodes) {
-    const w = Math.max(1, n.rssi + 100);
-    wx += n.pos[0] * w;
-    wz += n.pos[2] * w;
-    wSum += w;
-  }
-  if (wSum === 0) return [0, 0.5, 0];
-  return [clampArena(wx / wSum), 0.5, clampArena(wz / wSum)];
-}
-
-function clampArena(v) {
-  if (v > ARENA_RADIUS) return ARENA_RADIUS;
-  if (v < -ARENA_RADIUS) return -ARENA_RADIUS;
-  return v;
-}
-
-// Linearise (x-xi)^2 + (z-zi)^2 = di^2 against the strongest AP and solve
-// the resulting 2x2 normal equations. Returns null when the system is
-// degenerate (collinear APs).
-function leastSquares(nodes) {
-  const ref = nodes[0];
-  const rx = ref.pos[0], rz = ref.pos[2];
-  const dRef = rssiToDistance(ref.rssi);
-  const dRef2 = dRef * dRef;
-
-  // Build A (rows of [2(rx-xi), 2(rz-zi)]) and b (rows of di^2 - dRef^2 + ...)
-  let A11 = 0, A12 = 0, A22 = 0, b1 = 0, b2 = 0;
-  for (let i = 1; i < nodes.length; i++) {
-    const n = nodes[i];
-    const xi = n.pos[0], zi = n.pos[2];
-    const di2 = rssiToDistance(n.rssi) ** 2;
-    const a = 2 * (rx - xi);
-    const c = 2 * (rz - zi);
-    const rhs = di2 - dRef2 + rx * rx - xi * xi + rz * rz - zi * zi;
-    A11 += a * a;
-    A12 += a * c;
-    A22 += c * c;
-    b1 += a * rhs;
-    b2 += c * rhs;
-  }
-  const det = A11 * A22 - A12 * A12;
-  if (Math.abs(det) < 1e-6) return null;
-  const x = (A22 * b1 - A12 * b2) / det;
-  const z = (A11 * b2 - A12 * b1) / det;
-  return [clampArena(x), 0.5, clampArena(z)];
 }
 
 // ── AP Node ─────────────────────────────────────────────────────────────
@@ -297,7 +188,7 @@ const APNodeMemo = memo(APNode, (prev, next) => {
 });
 
 // ── User orb + trail ────────────────────────────────────────────────────
-function UserOrb({ targetPosition, currentRssi, connectedChannel, linkUp }) {
+function UserOrb({ targetPosition, currentRssi, connectedChannel, linkUp, localizable = true }) {
   const groupRef = useRef();
   const currentPos = useRef(new THREE.Vector3(0, 0.5, 0));
   const ringRef = useRef();
@@ -384,6 +275,17 @@ function UserOrb({ targetPosition, currentRssi, connectedChannel, linkUp }) {
               position={[0, -0.05, 0]}
             >
               CH{connectedChannel} · {currentRssi} dBm
+            </Text>
+          )}
+          {linkUp && !localizable && (
+            <Text
+              fontSize={0.1}
+              color="#ffaa00"
+              anchorX="center"
+              anchorY="top"
+              position={[0, -0.22, 0]}
+            >
+              no localization target
             </Text>
           )}
           {!linkUp && (
@@ -546,6 +448,7 @@ function GridFloor() {
 export default function MeshScene({ meshData, roamEvents = [] }) {
   const [processedNodes, setProcessedNodes] = useState([]);
   const [userTarget, setUserTarget] = useState([0, 0.5, 0]);
+  const [localizable, setLocalizable] = useState(false);
   const smoothTarget = useRef([0, 0.5, 0]);
   const layoutRef = useRef(new Map());
 
@@ -565,15 +468,16 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
 
   useEffect(() => {
     if (!roamEvents.length) return;
-    const fresh = roamEvents.filter((e) => !seenRoamIds.current.has(e.id));
-    if (!fresh.length) return;
-    for (const e of fresh) seenRoamIds.current.add(e.id);
-    // Re-sync the seen-set to the current event window so it can't grow
-    // without bound across long sessions.
+    // Drop ids no longer in the live window first — happens every effect
+    // run, not gated on having fresh work to do, so the set tracks the
+    // event window even during long quiet periods.
     const liveIds = new Set(roamEvents.map((e) => e.id));
     for (const id of seenRoamIds.current) {
       if (!liveIds.has(id)) seenRoamIds.current.delete(id);
     }
+    const fresh = roamEvents.filter((e) => !seenRoamIds.current.has(e.id));
+    if (!fresh.length) return;
+    for (const e of fresh) seenRoamIds.current.add(e.id);
     const stamped = fresh.map((e) => ({
       ...e,
       x: smoothTarget.current[0],
@@ -648,21 +552,27 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
 
     setProcessedNodes(positioned);
 
-    // Trilaterate against mesh peers when we're connected; otherwise use the
-    // strongest networks available so the puck still moves before a link.
+    // Trilaterate only against the APs that belong to the network we're
+    // actually attached to. Falling back to "top N strongest neighbours"
+    // produces a position the user can't act on — they'd see the puck move
+    // when an unrelated AP's RSSI fluctuated. When no target set exists,
+    // ease the puck back to the origin and surface the state to the HUD.
     const meshNodes = connectedSSID
       ? positioned.filter((n) => n.ssid === connectedSSID)
       : [];
-    const trilaterationNodes = meshNodes.length >= 1
-      ? meshNodes
-      : positioned.slice(0, Math.min(positioned.length, 5));
 
-    const trilateratedInput = trilaterationNodes.map((n) => {
-      const filterBuf = rssiFilterRef.current.get(n.key) ?? [n.rssi];
-      return { pos: n.pos, rssi: median(filterBuf) };
-    });
-
-    const raw = trilaterate(trilateratedInput, smoothTarget.current);
+    let raw;
+    if (meshNodes.length >= 1) {
+      const trilateratedInput = meshNodes.map((n) => {
+        const filterBuf = rssiFilterRef.current.get(n.key) ?? [n.rssi];
+        return { pos: n.pos, rssi: median(filterBuf) };
+      });
+      raw = trilaterate(trilateratedInput, smoothTarget.current);
+      setLocalizable(true);
+    } else {
+      raw = [0, 0.5, 0];
+      setLocalizable(false);
+    }
 
     const prev = smoothTarget.current;
     let dx = SMOOTH_ALPHA * (raw[0] - prev[0]);
@@ -703,6 +613,7 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
         currentRssi={connectedRssi}
         connectedChannel={connectedChannel}
         linkUp={linkUp}
+        localizable={localizable}
       />
       <ConnectionLines
         userPos={userTarget}

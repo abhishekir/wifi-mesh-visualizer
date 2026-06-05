@@ -70,28 +70,52 @@ def health_from_rssi(rssi: int) -> str:
 
 
 def _rssi_from_cache(channel: int, ssid: str | None) -> int | None:
-    """When CoreWLAN reports rssi=0 (common on modern macOS without sudo),
-    fall back to the strongest cached scan entry for our channel."""
+    """Strongest cached RSSI for the (channel, ssid) pair, or None.
+
+    Only back-fills when SSID is known — channel-only matches risk picking a
+    neighbour AP on a crowded 2.4 GHz channel and over-reporting our link by
+    10–20 dB. Caller is expected to show 'Unknown' health when this returns
+    None.
+    """
+    if not channel or not ssid:
+        return None
+    with _cache_lock:
+        candidates = [
+            n for n in _cached_nodes
+            if n["channel"] == channel and n["ssid"] == ssid
+        ]
+    if not candidates:
+        return None
+    return max(n["rssi"] for n in candidates)
+
+
+def _infer_ssid_from_cache(channel: int, current_rssi: int) -> str | None:
+    """Best-guess SSID for the current channel from the latest scan.
+
+    If we have a real live RSSI, pick the candidate whose own scan RSSI is
+    closest — that's most likely the AP we're attached to. If we have no
+    live RSSI (rssi=0), pick the strongest AP on this channel: still a
+    guess, but the most likely correct one.
+    """
     if not channel:
         return None
     with _cache_lock:
         candidates = [n for n in _cached_nodes if n["channel"] == channel]
     if not candidates:
         return None
-    if ssid:
-        same_ssid = [n for n in candidates if n["ssid"] == ssid]
-        if same_ssid:
-            return max(n["rssi"] for n in same_ssid)
-    return max(n["rssi"] for n in candidates)
+    if current_rssi:
+        candidates.sort(key=lambda n: abs(n["rssi"] - current_rssi))
+    else:
+        candidates.sort(key=lambda n: n["rssi"], reverse=True)
+    return candidates[0]["ssid"]
 
 
 def poll_wifi() -> dict:
-    """One snapshot of the current connection. Always returns a dict so the
-    UI can distinguish 'no link' from 'transport dead'.
+    """Raw snapshot from CoreWLAN — no SSID inference, no RSSI back-fill.
 
-    On modern macOS, `rssiValue()` returns 0 unless the process is privileged.
-    We treat 0 as 'reading unavailable' and back-fill from the most recent
-    background scan rather than reporting a misleading 'Excellent' link.
+    Always returns a dict so the UI can distinguish 'no link' from 'transport
+    dead'. Callers that want inference/back-fill should use
+    `get_current_connection`.
     """
     try:
         with _iface_lock:
@@ -119,30 +143,14 @@ def poll_wifi() -> dict:
             "timestamp": time.time(),
         }
 
-    rssi_source = "iface"
-    if rssi == 0:
-        backfill = _rssi_from_cache(int(channel), ssid)
-        if backfill is not None:
-            rssi = backfill
-            rssi_source = "scan"
-
-    if rssi == 0:
-        health = "Unknown"
-    else:
-        health = health_from_rssi(rssi)
-
-    snr = (rssi - noise) if (rssi and noise) else 0
-
     return {
         "linkUp": True,
-        "ssid": ssid or "Unknown",
+        "ssid": ssid,
         "rssi": int(rssi),
         "noise": int(noise),
-        "snr": int(snr),
-        "txRate": round(float(tx_rate), 1),
+        # PyObjC may return None on transient errors — guard the float cast.
+        "txRate": round(float(tx_rate or 0), 1),
         "channel": int(channel),
-        "health": health,
-        "rssiSource": rssi_source,
         "timestamp": time.time(),
     }
 
@@ -239,22 +247,40 @@ def scanner_loop():
 
 
 def get_current_connection() -> dict:
-    """Live connection info. When macOS hides our SSID, infer it from the
-    cached scan by matching channel + closest RSSI."""
+    """Live connection info with SSID inference and RSSI back-fill applied.
+
+    Order matters: infer SSID first (so the back-fill can look up the right
+    AP), then back-fill RSSI (so the noise/snr/health values can be derived
+    consistently). The terrain and mesh streams both call this.
+    """
     snap = poll_wifi()
-    ssid = snap.get("ssid")
-    channel = snap.get("channel", 0)
-    rssi = snap.get("rssi", 0)
+    if not snap.get("linkUp"):
+        return snap
 
-    if (not ssid or ssid == "Unknown") and channel:
-        with _cache_lock:
-            candidates = [n for n in _cached_nodes if n["channel"] == channel]
-        if candidates:
-            candidates.sort(key=lambda n: abs(n["rssi"] - rssi))
-            ssid = candidates[0]["ssid"]
-            snap["ssid"] = ssid
+    rssi_source = "iface"
+
+    # 1) SSID inference for macOS-hidden current network.
+    if not snap.get("ssid") and snap.get("channel"):
+        inferred = _infer_ssid_from_cache(snap["channel"], snap["rssi"])
+        if inferred:
+            snap["ssid"] = inferred
             snap["ssidInferred"] = True
+    if not snap.get("ssid"):
+        snap["ssid"] = "Unknown"
 
+    # 2) RSSI back-fill for unprivileged rssiValue() → 0.
+    if snap["rssi"] == 0 and snap["ssid"] != "Unknown":
+        backfill = _rssi_from_cache(snap["channel"], snap["ssid"])
+        if backfill is not None:
+            snap["rssi"] = backfill
+            rssi_source = "scan"
+
+    # 3) Derived values — health and SNR after rssi is final.
+    snap["health"] = health_from_rssi(snap["rssi"]) if snap["rssi"] else "Unknown"
+    snap["snr"] = (
+        snap["rssi"] - snap["noise"] if snap["rssi"] and snap["noise"] else 0
+    )
+    snap["rssiSource"] = rssi_source
     return snap
 
 
@@ -414,7 +440,7 @@ async def main():
     else:
         log.warning("initial scan returned 0 APs")
 
-    terrain_task = asyncio.create_task(producer(terrain_bus, poll_wifi, TERRAIN_HZ))
+    terrain_task = asyncio.create_task(producer(terrain_bus, get_current_connection, TERRAIN_HZ))
     mesh_task = asyncio.create_task(producer(mesh_bus, _build_mesh_payload, MESH_HZ))
 
     async with websockets.serve(handler, HOST, PORT):
