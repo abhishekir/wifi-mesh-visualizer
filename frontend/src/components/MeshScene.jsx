@@ -417,13 +417,44 @@ function RoamingMarkers({ events }) {
 }
 
 // ── Connection beam (only when linked) ──────────────────────────────────
-function ConnectionLines({ userPos, nodes, connectedSSID, connectedChannel, linkUp }) {
+// When the SSID was inferred from the cached scan (CoreWLAN hid the live
+// SSID), the beam is dimmer, amber instead of cyan, and tagged "inferred"
+// so the uncertainty is visible at a glance — not just a `~` next to the
+// SSID label in the HUD.
+function ConnectionLines({
+  userPos,
+  nodes,
+  connectedSSID,
+  connectedChannel,
+  linkUp,
+  ssidInferred = false,
+}) {
   if (!linkUp) return null;
   const connectedNode = nodes.find(
     (n) => n.ssid === connectedSSID && n.channel === connectedChannel
   );
   if (!connectedNode) return null;
   const points = [userPos, connectedNode.pos];
+
+  if (ssidInferred) {
+    const mid = [
+      (userPos[0] + connectedNode.pos[0]) / 2,
+      Math.max(userPos[1], connectedNode.pos[1]) + 0.25,
+      (userPos[2] + connectedNode.pos[2]) / 2,
+    ];
+    return (
+      <>
+        <Line points={points} color="#ffaa00" lineWidth={6} transparent opacity={0.15} />
+        <Line points={points} color="#ffcc66" lineWidth={2} transparent opacity={0.45} dashed dashSize={0.15} gapSize={0.1} />
+        <Billboard position={mid}>
+          <Text fontSize={0.1} color="#ffaa00" anchorX="center">
+            inferred link
+          </Text>
+        </Billboard>
+      </>
+    );
+  }
+
   return (
     <>
       <Line points={points} color="#4488ff" lineWidth={8} transparent opacity={0.25} />
@@ -465,6 +496,7 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
   const connectedChannel = connection?.channel ?? 0;
   const connectedRssi = connection?.rssi ?? null;
   const linkUp = !!connection?.linkUp;
+  const ssidInferred = !!connection?.ssidInferred;
 
   useEffect(() => {
     if (!roamEvents.length) return;
@@ -621,6 +653,7 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
         connectedSSID={connectedSSID}
         connectedChannel={connectedChannel}
         linkUp={linkUp}
+        ssidInferred={ssidInferred}
       />
     </>
   );

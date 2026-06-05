@@ -91,7 +91,12 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
               <span style={styles.value}>
                 {connection.ssid}
                 {connection.ssidInferred && (
-                  <span style={styles.inferred} title="SSID inferred from scan">~</span>
+                  <span
+                    style={styles.inferredBadge}
+                    title="SSID hidden by macOS — inferred from the latest scan by channel + RSSI proximity. The connection beam below is dashed amber while this is in effect."
+                  >
+                    inferred
+                  </span>
                 )}
               </span>
             </div>
@@ -295,6 +300,18 @@ const styles = {
   label: { color: "#778" },
   value: { fontWeight: 600, color: "#ccc" },
   inferred: { color: "#888", marginLeft: 4, fontSize: 10 },
+  inferredBadge: {
+    color: "#ffaa00",
+    background: "rgba(255,170,0,0.12)",
+    border: "1px solid rgba(255,170,0,0.3)",
+    borderRadius: 3,
+    padding: "0 5px",
+    marginLeft: 6,
+    fontSize: 9,
+    letterSpacing: 0.5,
+    textTransform: "uppercase",
+    fontWeight: 700,
+  },
   bandTag: { color: "#667", marginLeft: 4, fontSize: 10 },
   healthBadge: {
     display: "flex",

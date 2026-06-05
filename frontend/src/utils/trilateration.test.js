@@ -149,11 +149,23 @@ describe("leastSquares", () => {
     expect(out[2]).toBeCloseTo(truth[2], 1);
   });
 
-  it("returns null on collinear APs (singular system)", () => {
+  it("returns null on collinear APs along z=0 (singular system)", () => {
     const aps = [
       ap(-3, 0, -60),
       ap(0, 0, -55),
       ap(3, 0, -60),
+    ];
+    expect(leastSquares(aps)).toBeNull();
+  });
+
+  // Mirror of the case above — catches a future transpose bug where the x
+  // and z accumulators get swapped (z=0 collinear would still degenerate
+  // but x=0 collinear would silently produce a number).
+  it("returns null on collinear APs along x=0 (singular system)", () => {
+    const aps = [
+      ap(0, -3, -60),
+      ap(0, 0, -55),
+      ap(0, 3, -60),
     ];
     expect(leastSquares(aps)).toBeNull();
   });
