@@ -1,251 +1,461 @@
 #!/usr/bin/env python3
 """
 Wi-Fi Visualizer — Unified Server
-Serves both terrain (10Hz) and mesh (10Hz) data over a single
-WebSocket server on port 8765, routed by path:
+
+Serves terrain (10 Hz) and mesh (10 Hz) snapshots over one WebSocket on
+port 8765, routed by path:
   ws://127.0.0.1:8765/terrain
   ws://127.0.0.1:8765/mesh
+
+Architecture:
+  * One CoreWLAN poller per stream produces snapshots on an asyncio loop.
+  * Each client subscribes to a small bounded queue. Slow clients drop frames
+    instead of holding back the producer.
+  * A background thread runs the heavy `scanForNetworksWithName_error_` call
+    every SCAN_INTERVAL seconds and updates a cache the mesh stream reads.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 import threading
 import time
+from collections import defaultdict
 
 import websockets
 from CoreWLAN import CWWiFiClient
 
-# --- Shared CoreWLAN handle ---
+# ── Tunables ────────────────────────────────────────────────────────────
+HOST = "127.0.0.1"
+PORT = 8765
+SCAN_INTERVAL = 3.0          # seconds between background full scans
+SCAN_STALE_AFTER = 15.0      # cached scan is dropped if older than this
+TERRAIN_HZ = 10
+MESH_HZ = 10
+MAX_QUEUE = 2                # per-client buffer; drop oldest under backpressure
+
+# ── Logging ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+log = logging.getLogger("wifi")
+
+# ── Shared CoreWLAN handle ──────────────────────────────────────────────
 _client = CWWiFiClient.sharedWiFiClient()
 _iface = _client.interface()
+_iface_lock = threading.Lock()   # CoreWLAN calls are not thread-safe
 
-# --- Thread synchronisation ---
-_iface_lock = threading.Lock()  # protects all _iface calls (CoreWLAN is not thread-safe)
-_lock = threading.Lock()        # protects _cached_nodes
+# ── Scan cache ──────────────────────────────────────────────────────────
+_cache_lock = threading.Lock()
 _cached_nodes: list[dict] = []
-SCAN_INTERVAL = 3.0
+_cached_at: float = 0.0
 
 
-# ────────────────────────────────────────
-# Terrain helpers (connected-network data)
-# ────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# CoreWLAN polling
+# ────────────────────────────────────────────────────────────────────────
 
-def poll_wifi() -> dict | None:
+def health_from_rssi(rssi: int) -> str:
+    if rssi >= -50:
+        return "Excellent"
+    if rssi >= -60:
+        return "Good"
+    if rssi >= -70:
+        return "Fair"
+    return "Poor"
+
+
+def _rssi_from_cache(channel: int, ssid: str | None) -> int | None:
+    """Strongest cached RSSI for the (channel, ssid) pair, or None.
+
+    Only back-fills when SSID is known — channel-only matches risk picking a
+    neighbour AP on a crowded 2.4 GHz channel and over-reporting our link by
+    10–20 dB. Caller is expected to show 'Unknown' health when this returns
+    None.
+    """
+    if not channel or not ssid:
+        return None
+    with _cache_lock:
+        candidates = [
+            n for n in _cached_nodes
+            if n["channel"] == channel and n["ssid"] == ssid
+        ]
+    if not candidates:
+        return None
+    return max(n["rssi"] for n in candidates)
+
+
+def _infer_ssid_from_cache(channel: int, current_rssi: int) -> str | None:
+    """Best-guess SSID for the current channel from the latest scan.
+
+    If we have a real live RSSI, pick the candidate whose own scan RSSI is
+    closest — that's most likely the AP we're attached to. If we have no
+    live RSSI (rssi=0), pick the strongest AP on this channel: still a
+    guess, but the most likely correct one.
+    """
+    if not channel:
+        return None
+    with _cache_lock:
+        candidates = [n for n in _cached_nodes if n["channel"] == channel]
+    if not candidates:
+        return None
+    if current_rssi:
+        candidates.sort(key=lambda n: abs(n["rssi"] - current_rssi))
+    else:
+        candidates.sort(key=lambda n: n["rssi"], reverse=True)
+    return candidates[0]["ssid"]
+
+
+def poll_wifi() -> dict:
+    """Raw snapshot from CoreWLAN — no SSID inference, no RSSI back-fill.
+
+    Always returns a dict so the UI can distinguish 'no link' from 'transport
+    dead'. Callers that want inference/back-fill should use
+    `get_current_connection`.
+    """
     try:
         with _iface_lock:
             rssi = _iface.rssiValue()
             noise = _iface.noiseMeasurement()
             tx_rate = _iface.transmitRate()
-            ssid = _iface.ssid() or "Unknown"
+            ssid = _iface.ssid()
             ch_obj = _iface.wlanChannel()
             channel = ch_obj.channelNumber() if ch_obj else 0
-        snr = rssi - noise
+    except Exception as exc:
+        log.warning("poll_wifi failed: %s", exc)
+        return {"linkUp": False, "error": str(exc), "timestamp": time.time()}
 
-        if rssi == 0 and noise == 0:
-            return None
-
-        if rssi >= -50:
-            health = "Excellent"
-        elif rssi >= -60:
-            health = "Good"
-        elif rssi >= -70:
-            health = "Fair"
-        else:
-            health = "Poor"
-
+    link_up = bool(rssi) or bool(noise) or bool(ssid) or bool(channel)
+    if not link_up:
         return {
-            "rssi": rssi, "noise": noise, "txRate": int(tx_rate),
-            "snr": snr, "ssid": ssid, "channel": channel,
-            "health": health, "timestamp": time.time(),
+            "linkUp": False,
+            "ssid": None,
+            "rssi": 0,
+            "noise": 0,
+            "snr": 0,
+            "txRate": 0,
+            "channel": 0,
+            "health": "Offline",
+            "timestamp": time.time(),
         }
-    except Exception:
-        return None
 
+    return {
+        "linkUp": True,
+        "ssid": ssid,
+        "rssi": int(rssi),
+        "noise": int(noise),
+        # PyObjC may return None on transient errors — guard the float cast.
+        "txRate": round(float(tx_rate or 0), 1),
+        "channel": int(channel),
+        "timestamp": time.time(),
+    }
 
-async def stream_terrain(websocket):
-    print(f"[terrain] client connected: {websocket.remote_address}")
-    try:
-        while True:
-            data = await asyncio.to_thread(poll_wifi)
-            msg = json.dumps(data if data else {"error": "No Wi-Fi data"})
-            await websocket.send(msg)
-            await asyncio.sleep(0.1)  # 10 Hz
-    except websockets.exceptions.ConnectionClosed:
-        print(f"[terrain] client disconnected: {websocket.remote_address}")
-
-
-# ──────────────────────────
-# Mesh scanner helpers
-# ──────────────────────────
 
 def scan_networks() -> list[dict]:
+    """Full passive scan. Returns deduplicated APs sorted strongest first.
+
+    Mesh detection: a network is "mesh" if it has more than one *distinct
+    BSSID*, regardless of channel — that's the only signal that two physical
+    radios are broadcasting the same SSID.
+    """
     try:
         with _iface_lock:
             networks, error = _iface.scanForNetworksWithName_error_(None, None)
-        if error or not networks:
-            return []
+    except Exception as exc:
+        log.warning("scan failed: %s", exc)
+        return []
+    if error or not networks:
+        return []
 
-        raw = []
-        for net in networks:
+    raw: list[dict] = []
+    for net in networks:
+        try:
             ssid = net.ssid()
             if not ssid:
                 continue
-            rssi = net.rssiValue()
+            rssi = int(net.rssiValue())
             ch_obj = net.wlanChannel()
             channel = ch_obj.channelNumber() if ch_obj else 0
             band = "5GHz" if channel > 14 else "2.4GHz"
-            bssid = net.bssid() or f"{ssid}:{channel}"
-            raw.append({
-                "ssid": ssid, "bssid": bssid, "rssi": rssi,
-                "channel": channel, "band": band,
-            })
+            bssid = net.bssid()
+            if not bssid:
+                # macOS hides BSSID for non-connected APs under some privacy
+                # settings. Use a stable synthetic id keyed on SSID+channel
+                # so the same hidden AP keeps its identity across scans (and
+                # therefore its colour and on-screen position). The cost is
+                # that two distinct hidden radios on the same SSID+channel
+                # collapse into one — accept that trade since mesh detection
+                # relies on the *visible* BSSID count anyway.
+                bssid = f"hidden:{ssid}:{channel}"
+        except Exception as exc:
+            log.debug("net parse failed: %s", exc)
+            continue
 
-        raw.sort(key=lambda x: x["rssi"], reverse=True)
+        raw.append({
+            "ssid": ssid,
+            "bssid": bssid,
+            "rssi": rssi,
+            "channel": channel,
+            "band": band,
+        })
 
-        # Deduplicate: keep only the strongest signal per SSID+channel
-        seen: dict[str, dict] = {}
-        for node in raw:
-            key = f"{node['ssid']}:{node['channel']}"
-            if key not in seen or node["rssi"] > seen[key]["rssi"]:
-                seen[key] = node
-        deduped = list(seen.values())
-        deduped.sort(key=lambda x: x["rssi"], reverse=True)
+    # Deduplicate by BSSID (a single radio scanned twice in one pass).
+    by_bssid: dict[str, dict] = {}
+    for node in raw:
+        existing = by_bssid.get(node["bssid"])
+        if existing is None or node["rssi"] > existing["rssi"]:
+            by_bssid[node["bssid"]] = node
+    deduped = sorted(by_bssid.values(), key=lambda n: n["rssi"], reverse=True)
 
-        # Mark mesh networks (SSIDs with multiple channels/nodes)
-        ssid_groups: dict[str, list] = {}
-        for node in deduped:
-            ssid_groups.setdefault(node["ssid"], []).append(node)
-        for node in deduped:
-            grp = ssid_groups[node["ssid"]]
-            node["isMesh"] = len(grp) > 1
-            node["meshNodeCount"] = len(grp)
+    # Mesh = an SSID broadcast by >1 distinct BSSID anywhere in this scan.
+    bssids_per_ssid: dict[str, set[str]] = defaultdict(set)
+    channels_per_ssid: dict[str, set[int]] = defaultdict(set)
+    for node in deduped:
+        bssids_per_ssid[node["ssid"]].add(node["bssid"])
+        channels_per_ssid[node["ssid"]].add(node["channel"])
 
-        return deduped
-    except Exception as e:
-        print(f"Scan error: {e}")
-        return []
+    for node in deduped:
+        bcount = len(bssids_per_ssid[node["ssid"]])
+        ccount = len(channels_per_ssid[node["ssid"]])
+        node["isMesh"] = bcount > 1
+        node["meshNodeCount"] = bcount
+        node["meshChannelCount"] = ccount
+
+    return deduped
 
 
 def scanner_loop():
-    global _cached_nodes
+    """Background scan loop. Always publishes (even empty results) so the
+    cache reflects current reality; downstream code uses _cached_at to
+    age-out stale data when scans start failing entirely."""
+    global _cached_nodes, _cached_at
     while True:
         nodes = scan_networks()
-        if nodes:
-            with _lock:
+        with _cache_lock:
+            if nodes:
                 _cached_nodes = nodes
+                _cached_at = time.time()
+            elif time.time() - _cached_at > SCAN_STALE_AFTER:
+                # Wi-Fi has gone away — drop the cache rather than lie.
+                _cached_nodes = []
+                _cached_at = 0.0
         time.sleep(SCAN_INTERVAL)
 
 
 def get_current_connection() -> dict:
-    try:
-        with _iface_lock:
-            ssid = _iface.ssid()  # may be None due to macOS privacy
-            rssi = _iface.rssiValue()
-            ch_obj = _iface.wlanChannel()
-            channel = ch_obj.channelNumber() if ch_obj else 0
-            noise = _iface.noiseMeasurement()
-            tx_rate = int(_iface.transmitRate())
+    """Live connection info with SSID inference and RSSI back-fill applied.
 
-        # If SSID is hidden by macOS privacy, infer it from scan data
-        # by matching channel + closest RSSI
-        if not ssid:
-            with _lock:
-                candidates = [n for n in _cached_nodes
-                              if n["channel"] == channel]
-            if candidates:
-                candidates.sort(key=lambda n: abs(n["rssi"] - rssi))
-                ssid = candidates[0]["ssid"]
+    Order matters: infer SSID first (so the back-fill can look up the right
+    AP), then back-fill RSSI (so the noise/snr/health values can be derived
+    consistently). The terrain and mesh streams both call this.
+    """
+    snap = poll_wifi()
+    if not snap.get("linkUp"):
+        return snap
 
-        return {
-            "ssid": ssid or "Unknown",
-            "rssi": rssi,
-            "noise": noise,
-            "txRate": tx_rate,
-            "channel": channel,
-        }
-    except Exception:
-        return {"ssid": "Unknown", "rssi": -80, "noise": -90,
-                "txRate": 0, "channel": 0}
+    rssi_source = "iface"
+
+    # 1) SSID inference for macOS-hidden current network.
+    if not snap.get("ssid") and snap.get("channel"):
+        inferred = _infer_ssid_from_cache(snap["channel"], snap["rssi"])
+        if inferred:
+            snap["ssid"] = inferred
+            snap["ssidInferred"] = True
+    if not snap.get("ssid"):
+        snap["ssid"] = "Unknown"
+
+    # 2) RSSI back-fill for unprivileged rssiValue() → 0.
+    if snap["rssi"] == 0 and snap["ssid"] != "Unknown":
+        backfill = _rssi_from_cache(snap["channel"], snap["ssid"])
+        if backfill is not None:
+            snap["rssi"] = backfill
+            rssi_source = "scan"
+
+    # 3) Derived values — health and SNR after rssi is final.
+    snap["health"] = health_from_rssi(snap["rssi"]) if snap["rssi"] else "Unknown"
+    snap["snr"] = (
+        snap["rssi"] - snap["noise"] if snap["rssi"] and snap["noise"] else 0
+    )
+    snap["rssiSource"] = rssi_source
+    return snap
 
 
-def inject_live_rssi(nodes, connection):
-    """Update the cached node matching our connected network with a live RSSI
-    reading so the user position tracks movement between full scans."""
-    live_rssi = connection["rssi"]
-    live_ch = connection["channel"]
-    live_ssid = connection["ssid"]
+def inject_live_rssi(nodes: list[dict], connection: dict) -> list[dict]:
+    """Refresh the cached node we're connected to with the live RSSI so
+    motion shows up between full scans. Match SSID+channel only — never
+    cross networks just because two share a channel."""
+    if not connection.get("linkUp"):
+        return nodes
+    live_rssi = connection.get("rssi", 0)
+    live_ch = connection.get("channel", 0)
+    live_ssid = connection.get("ssid")
+    # Don't inject when we don't actually have a fresh live reading — that
+    # would clobber a real -46 from the scan with a meaningless 0.
+    if (
+        not live_ssid
+        or live_ssid == "Unknown"
+        or not live_ch
+        or not live_rssi
+    ):
+        return nodes
     for node in nodes:
-        # Match by SSID+channel, or by channel alone if SSID was inferred
-        if node["channel"] == live_ch and (
-            node["ssid"] == live_ssid or live_ssid == "Unknown"
-        ):
+        if node["channel"] == live_ch and node["ssid"] == live_ssid:
             node["rssi"] = live_rssi
+            node["live"] = True
             break
     return nodes
 
 
-def _build_mesh_payload():
-    """Build mesh payload in a thread so _iface_lock doesn't block the event loop."""
-    with _lock:
+def _build_mesh_payload() -> dict:
+    with _cache_lock:
         nodes = [dict(n) for n in _cached_nodes]
+        cached_at = _cached_at
     connection = get_current_connection()
     nodes = inject_live_rssi(nodes, connection)
     return {
         "nodes": nodes,
         "connection": connection,
+        "scanAge": (time.time() - cached_at) if cached_at else None,
+        "scanStale": cached_at == 0.0,
         "timestamp": time.time(),
     }
 
 
-async def stream_mesh(websocket):
-    print(f"[mesh] client connected: {websocket.remote_address}")
+# ────────────────────────────────────────────────────────────────────────
+# Pub/sub fan-out
+# ────────────────────────────────────────────────────────────────────────
+
+class Broadcaster:
+    """One producer task pushes snapshots; many subscriber queues receive
+    them. Slow consumers drop the oldest frame instead of blocking."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self._subs: set[asyncio.Queue] = set()
+        self._lock = asyncio.Lock()
+
+    async def add(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE)
+        async with self._lock:
+            self._subs.add(q)
+        return q
+
+    async def remove(self, q: asyncio.Queue) -> None:
+        async with self._lock:
+            self._subs.discard(q)
+
+    def publish(self, payload: dict) -> None:
+        for q in list(self._subs):
+            if q.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    q.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(payload)
+
+    def subscriber_count(self) -> int:
+        return len(self._subs)
+
+
+terrain_bus = Broadcaster("terrain")
+mesh_bus = Broadcaster("mesh")
+
+
+async def producer(bus: Broadcaster, build, hz: int):
+    """Poll at fixed rate while at least one client is subscribed."""
+    period = 1.0 / hz
+    idle_period = 0.5  # check less often when no one is listening
+    while True:
+        if bus.subscriber_count() == 0:
+            await asyncio.sleep(idle_period)
+            continue
+        try:
+            payload = await asyncio.to_thread(build)
+            bus.publish(payload)
+        except Exception:
+            log.exception("producer %s build failed", bus.name)
+        await asyncio.sleep(period)
+
+
+async def serve_stream(websocket, bus: Broadcaster):
+    peer = websocket.remote_address
+    log.info("[%s] connect %s (subs=%d)", bus.name, peer, bus.subscriber_count() + 1)
+    q = await bus.add()
     try:
         while True:
-            payload = await asyncio.to_thread(_build_mesh_payload)
+            payload = await q.get()
             await websocket.send(json.dumps(payload))
-            await asyncio.sleep(0.1)  # 10 Hz — live RSSI makes this useful
     except websockets.exceptions.ConnectionClosed:
-        print(f"[mesh] client disconnected: {websocket.remote_address}")
+        pass
+    except Exception:
+        log.exception("[%s] stream error %s", bus.name, peer)
+    finally:
+        await bus.remove(q)
+        log.info("[%s] disconnect %s (subs=%d)", bus.name, peer, bus.subscriber_count())
 
 
-# ─────────────────────────
-# Path-based routing
-# ─────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# Routing
+# ────────────────────────────────────────────────────────────────────────
+
+def _request_path(websocket, legacy_path):
+    if legacy_path is not None:
+        return legacy_path
+    req = getattr(websocket, "request", None)
+    if req is not None and getattr(req, "path", None):
+        return req.path
+    return getattr(websocket, "path", "/terrain")
+
 
 async def handler(websocket, path=None):
-    # Legacy API passes path as 2nd arg; modern API uses websocket.request.path
-    if path is None:
-        path = getattr(websocket, "path", "/terrain")
-    if path == "/mesh":
-        await stream_mesh(websocket)
+    p = _request_path(websocket, path)
+    if p.startswith("/mesh"):
+        await serve_stream(websocket, mesh_bus)
+    elif p.startswith("/terrain"):
+        await serve_stream(websocket, terrain_bus)
     else:
-        # default to terrain
-        await stream_terrain(websocket)
+        log.warning("unknown path %r, defaulting to terrain", p)
+        await serve_stream(websocket, terrain_bus)
 
+
+# ────────────────────────────────────────────────────────────────────────
+# Entrypoint
+# ────────────────────────────────────────────────────────────────────────
 
 async def main():
-    # Start background mesh scanner
     threading.Thread(target=scanner_loop, daemon=True).start()
-    print("Background mesh scanner started")
+    log.info("background scanner started (interval=%.1fs)", SCAN_INTERVAL)
 
-    initial = scan_networks()
+    # Warm cache so the first /mesh client sees data immediately.
+    initial = await asyncio.to_thread(scan_networks)
     if initial:
-        global _cached_nodes
-        with _lock:
+        global _cached_nodes, _cached_at
+        with _cache_lock:
             _cached_nodes = initial
-        print(f"Initial scan: {len(initial)} access points")
+            _cached_at = time.time()
+        log.info("initial scan: %d APs", len(initial))
+    else:
+        log.warning("initial scan returned 0 APs")
 
-    async with websockets.serve(handler, "127.0.0.1", 8765):
-        print()
-        print("  Wi-Fi Visualizer server running")
-        print("  ws://127.0.0.1:8765/terrain  (signal terrain, 10Hz)")
-        print("  ws://127.0.0.1:8765/mesh     (mesh scanner, 10Hz)")
-        print()
-        print("  Press Ctrl+C to stop.")
-        await asyncio.Future()
+    terrain_task = asyncio.create_task(producer(terrain_bus, get_current_connection, TERRAIN_HZ))
+    mesh_task = asyncio.create_task(producer(mesh_bus, _build_mesh_payload, MESH_HZ))
+
+    async with websockets.serve(handler, HOST, PORT):
+        log.info("Wi-Fi Visualizer server running on ws://%s:%d", HOST, PORT)
+        log.info("  /terrain  (signal terrain, %d Hz)", TERRAIN_HZ)
+        log.info("  /mesh     (mesh scanner, %d Hz)", MESH_HZ)
+        try:
+            await asyncio.Future()
+        finally:
+            terrain_task.cancel()
+            mesh_task.cancel()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("shutting down")

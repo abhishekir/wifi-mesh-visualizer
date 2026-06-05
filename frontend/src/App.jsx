@@ -9,31 +9,36 @@ import useWifiData from "./hooks/useWifiData";
 import useMeshData from "./hooks/useMeshData";
 import "./App.css";
 
+const MAX_ROAM_EVENTS = 50;
+
 class CanvasErrorBoundary extends Component {
   constructor(props) {
     super(props);
-    this.state = { hasError: false, retryKey: 0 };
+    this.state = { hasError: false, error: null, retryKey: 0 };
   }
-  static getDerivedStateFromError() {
-    return { hasError: true };
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error("Canvas crashed:", error, info);
   }
   render() {
     if (this.state.hasError) {
       return (
-        <div style={{
-          position: "absolute", inset: 0,
-          display: "flex", alignItems: "center", justifyContent: "center",
-          color: "#ff6666", fontFamily: "'SF Mono', monospace", fontSize: 14,
-          background: "#0a0c14",
-        }}>
-          3D renderer crashed.{" "}
+        <div style={errorStyles.wrap}>
+          <div style={errorStyles.title}>3D renderer crashed</div>
+          <div style={errorStyles.msg}>
+            {this.state.error?.message ?? "Unknown error"}
+          </div>
           <button
-            onClick={() => this.setState((s) => ({ hasError: false, retryKey: s.retryKey + 1 }))}
-            style={{
-              marginLeft: 12, padding: "6px 14px", background: "rgba(68,136,255,0.2)",
-              color: "#4488ff", border: "1px solid rgba(68,136,255,0.3)",
-              borderRadius: 6, cursor: "pointer", fontFamily: "inherit", fontSize: 12,
-            }}
+            onClick={() =>
+              this.setState((s) => ({
+                hasError: false,
+                error: null,
+                retryKey: s.retryKey + 1,
+              }))
+            }
+            style={errorStyles.btn}
           >
             Retry
           </button>
@@ -63,34 +68,50 @@ function CameraController({ view }) {
   return null;
 }
 
+let roamSeq = 0;
+
 function App() {
   const [view, setView] = useState("mesh");
   const { data, connected: terrainConnected } = useWifiData(view === "terrain");
   const { meshData, connected: meshConnected } = useMeshData(view === "mesh");
 
-  // Track roaming events at the app level
+  // Roaming events are uniquely identified so consumers can diff by id even
+  // when the bounded buffer drops older entries. (The server only exposes
+  // channel + SSID for the live connection, not BSSID, so we detect roams
+  // off channel changes alone.)
   const [roamEvents, setRoamEvents] = useState([]);
   const lastChannelRef = useRef(null);
 
   useEffect(() => {
-    if (!meshData?.connection) return;
-    const ch = meshData.connection.channel;
-    if (lastChannelRef.current !== null && ch !== lastChannelRef.current) {
-      setRoamEvents((prev) => [
-        ...prev.slice(-19),
-        {
-          from: lastChannelRef.current,
-          to: ch,
-          time: Date.now(),
-        },
-      ]);
+    const conn = meshData?.connection;
+    if (!conn || !conn.linkUp) {
+      lastChannelRef.current = null;
+      return;
+    }
+    const ch = conn.channel;
+    const prevCh = lastChannelRef.current;
+    if (prevCh !== null && ch !== prevCh) {
+      const evt = {
+        id: ++roamSeq,
+        from: prevCh,
+        to: ch,
+        time: Date.now(),
+      };
+      setRoamEvents((prev) => {
+        const next = prev.concat(evt);
+        return next.length > MAX_ROAM_EVENTS
+          ? next.slice(next.length - MAX_ROAM_EVENTS)
+          : next;
+      });
     }
     lastChannelRef.current = ch;
-  }, [meshData?.connection?.channel]);
+    // Only depend on the fields we actually compare against — re-running for
+    // every connection-object identity change would emit spurious roams.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meshData?.connection?.channel, meshData?.connection?.linkUp]);
 
   return (
     <div style={{ width: "100vw", height: "100vh", background: "#0a0c14" }}>
-      {/* View toggle */}
       <div style={styles.toggle}>
         <button
           onClick={() => setView("terrain")}
@@ -106,7 +127,6 @@ function App() {
         </button>
       </div>
 
-      {/* HUD */}
       {view === "terrain" ? (
         <SignalHUD data={data} connected={terrainConnected} />
       ) : (
@@ -117,7 +137,6 @@ function App() {
         />
       )}
 
-      {/* 3D Canvas */}
       <CanvasErrorBoundary>
         <Canvas
           camera={{
@@ -133,7 +152,7 @@ function App() {
 
           {view === "terrain" ? (
             <>
-              <WifiTerrain rssi={data?.rssi ?? null} />
+              <WifiTerrain rssi={data?.linkUp ? data.rssi : null} />
               <gridHelper args={[10, 20, "#1a1f30", "#1a1f30"]} />
             </>
           ) : (
@@ -187,6 +206,34 @@ const styles = {
     fontSize: 12,
     fontWeight: 600,
     letterSpacing: 0.5,
+  },
+};
+
+const errorStyles = {
+  wrap: {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "#0a0c14",
+    color: "#ff6666",
+    fontFamily: "'SF Mono', monospace",
+    gap: 10,
+  },
+  title: { fontSize: 16, fontWeight: 700 },
+  msg: { fontSize: 12, color: "#aaa", maxWidth: 480, textAlign: "center" },
+  btn: {
+    marginTop: 8,
+    padding: "6px 14px",
+    background: "rgba(68,136,255,0.2)",
+    color: "#4488ff",
+    border: "1px solid rgba(68,136,255,0.3)",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontSize: 12,
   },
 };
 
