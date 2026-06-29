@@ -285,16 +285,24 @@ def get_current_connection() -> dict:
 
 
 def inject_live_rssi(nodes: list[dict], connection: dict) -> list[dict]:
-    """Refresh the cached node we're connected to with the live RSSI so
-    motion shows up between full scans. Match SSID+channel only — never
-    cross networks just because two share a channel."""
+    """Tag the cached node we're connected to with the live RSSI in a
+    SEPARATE field — never overwrite `rssi`. Match SSID+channel only.
+
+    Why a separate field: live RSSI comes from the active antenna and is
+    typically 10–20 dB stronger than the same AP's passive-scan reading.
+    Other APs in the mesh only ever have scan readings. Mixing the two
+    feeds into trilateration makes the puck jump every time the laptop
+    roams — the "strong-reading bias" hops to whichever AP is currently
+    connected. Keeping `rssi` uniform across all APs and exposing the
+    live value as `liveRssi` lets the UI render fresh signal on the
+    connected AP without distorting the position math.
+    """
     if not connection.get("linkUp"):
         return nodes
     live_rssi = connection.get("rssi", 0)
     live_ch = connection.get("channel", 0)
     live_ssid = connection.get("ssid")
-    # Don't inject when we don't actually have a fresh live reading — that
-    # would clobber a real -46 from the scan with a meaningless 0.
+    # Don't inject when we don't actually have a fresh live reading.
     if (
         not live_ssid
         or live_ssid == "Unknown"
@@ -304,7 +312,7 @@ def inject_live_rssi(nodes: list[dict], connection: dict) -> list[dict]:
         return nodes
     for node in nodes:
         if node["channel"] == live_ch and node["ssid"] == live_ssid:
-            node["rssi"] = live_rssi
+            node["liveRssi"] = live_rssi
             node["live"] = True
             break
     return nodes

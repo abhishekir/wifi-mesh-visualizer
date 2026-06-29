@@ -17,9 +17,19 @@ const TRAIL_LENGTH = 80;
 const TRAIL_INTERVAL = 6;
 const HISTORY_MAX = 30;
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
-const RSSI_FILTER_SIZE = 7;
-const SMOOTH_ALPHA = 0.25;
-const MAX_STEP = 0.5;
+// Smoothing stack (see useEffect for how these compose):
+//   • RSSI_FILTER_SIZE = 11   → median over 1.1 s, ~3× noise reduction.
+//   • NOISE_DEADBAND   = 0.6  → live correction below this is treated as
+//     stationary RSSI noise; the puck snaps to the scan-only position.
+//   • DEADBAND_TRANSITION = 0.4 → soft fade so leaving the deadband isn't
+//     a discontinuity; real walking motion exceeds (0.6 + 0.4) m quickly.
+//   • SMOOTH_ALPHA     = 0.15 → ~1.5 s position-space lerp.
+//   • MAX_STEP         = 0.15 → walking-speed ceiling (≈1.5 m/s @ 10 Hz).
+const RSSI_FILTER_SIZE = 11;
+const NOISE_DEADBAND = 0.6;
+const DEADBAND_TRANSITION = 0.4;
+const SMOOTH_ALPHA = 0.15;
+const MAX_STEP = 0.15;
 
 // Heatmap
 const HEATMAP_SIZE = 20;
@@ -485,6 +495,14 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
 
   const historyRef = useRef(new Map());
   const rssiFilterRef = useRef(new Map());
+  // Per-AP gain bias = liveRssi − scanRssi captured at scan-refresh time.
+  // Lets us treat (currentLive − bias) as a scan-equivalent for the connected
+  // AP between scans, giving the puck a 10 Hz radial signal to track motion
+  // instead of waiting 3 s for the next full scan. Roams are safe: a newly-
+  // connected AP simply has no bias yet, so we fall back to its scan reading
+  // until the next refresh recalibrates.
+  const biasRef = useRef(new Map());
+  const lastScanTsRef = useRef(0);
 
   // Lift positioned roam events to state so the scene actually re-renders
   // when a roam fires between mesh frames.
@@ -529,8 +547,36 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
     const nodes = meshData.nodes;
     const layout = layoutRef.current;
 
+    // Detect a scan-cache refresh on the server. cached_at = timestamp − scanAge
+    // and only advances when scanner_loop publishes new data. Round to ms so
+    // FP jitter on the divide doesn't trigger spurious recalibrations.
+    const scanTs = meshData.scanAge != null
+      ? Math.round((meshData.timestamp - meshData.scanAge) * 1000)
+      : 0;
+    const freshScan = scanTs !== lastScanTsRef.current;
+    if (freshScan) lastScanTsRef.current = scanTs;
+
     const positioned = nodes.map((node) => {
       const key = `${node.bssid}:${node.channel}`;
+      const displayRssi = node.liveRssi ?? node.rssi;
+
+      // On a fresh scan, snapshot the gain bias for any AP we currently have
+      // a live reading for (in practice: only the connected AP).
+      if (freshScan && node.liveRssi != null) {
+        biasRef.current.set(key, node.liveRssi - node.rssi);
+      }
+
+      // Effective RSSI for trilateration:
+      //   • No live data → use the scan reading directly (stale but stable).
+      //   • Live data but no bias yet (just roamed, haven't seen a scan
+      //     since) → fall back to scan; tracking will start next refresh.
+      //   • Live data + bias → (currentLive − bias) is what the scan would
+      //     read right now if it could be sampled instantly.
+      let effectiveRssi = node.rssi;
+      const bias = biasRef.current.get(key);
+      if (node.liveRssi != null && bias != null) {
+        effectiveRssi = node.liveRssi - bias;
+      }
 
       if (!layout.has(key)) {
         // Golden-angle placement around the arena, with reach as a hint.
@@ -546,12 +592,12 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
       }
 
       const hist = historyRef.current.get(key) ?? [];
-      hist.push(node.rssi);
+      hist.push(displayRssi);
       if (hist.length > HISTORY_MAX) hist.shift();
       historyRef.current.set(key, hist);
 
       const filterBuf = rssiFilterRef.current.get(key) ?? [];
-      filterBuf.push(node.rssi);
+      filterBuf.push(effectiveRssi);
       if (filterBuf.length > RSSI_FILTER_SIZE) filterBuf.shift();
       rssiFilterRef.current.set(key, filterBuf);
 
@@ -559,10 +605,12 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
       return {
         ...node,
         key,
+        rssi: displayRssi,
+        scanRssi: node.rssi,
         pos: fixed.pos,
         color: fixed.color,
         label: fixed.label,
-        reach: rssiToReach(node.rssi),
+        reach: rssiToReach(displayRssi),
         history: hist.slice(),
       };
     });
@@ -573,6 +621,9 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
     }
     for (const key of rssiFilterRef.current.keys()) {
       if (!activeKeys.has(key)) rssiFilterRef.current.delete(key);
+    }
+    for (const key of biasRef.current.keys()) {
+      if (!activeKeys.has(key)) biasRef.current.delete(key);
     }
     // Cap the layout map too — transient APs (coffee-shop hotspots, phones in
     // motion) would otherwise leak entries for the lifetime of the session.
@@ -595,11 +646,36 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
 
     let raw;
     if (meshNodes.length >= 1) {
-      const trilateratedInput = meshNodes.map((n) => {
-        const filterBuf = rssiFilterRef.current.get(n.key) ?? [n.rssi];
+      // Two trilaterations:
+      //   pScan — scan-RSSI-only baseline. Updates every SCAN_INTERVAL (≈3 s)
+      //     but is stable between updates because the inputs don't change.
+      //   pLive — bias-corrected live tracking on the connected AP, scan
+      //     elsewhere. Updates at 10 Hz but carries RSSI noise.
+      const scanInput = meshNodes.map((n) => ({ pos: n.pos, rssi: n.scanRssi }));
+      const pScan = trilaterate(scanInput, smoothTarget.current);
+
+      const liveInput = meshNodes.map((n) => {
+        const filterBuf = rssiFilterRef.current.get(n.key) ?? [n.scanRssi];
         return { pos: n.pos, rssi: median(filterBuf) };
       });
-      raw = trilaterate(trilateratedInput, smoothTarget.current);
+      const pLive = trilaterate(liveInput, smoothTarget.current);
+
+      // Soft deadband: when stationary, RSSI noise puts pLive in a hovering
+      // halo around pScan (~30–60 cm); we ignore that and pin the puck to
+      // pScan. Real walking pushes |pLive − pScan| past the deadband within
+      // a step or two, at which point the correction fades in and the puck
+      // tracks the live signal smoothly.
+      const dx = pLive[0] - pScan[0];
+      const dz = pLive[2] - pScan[2];
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      const factor = dist <= NOISE_DEADBAND
+        ? 0
+        : Math.min(1, (dist - NOISE_DEADBAND) / DEADBAND_TRANSITION);
+      raw = [
+        pScan[0] + dx * factor,
+        0.5,
+        pScan[2] + dz * factor,
+      ];
       setLocalizable(true);
     } else {
       raw = [0, 0.5, 0];
