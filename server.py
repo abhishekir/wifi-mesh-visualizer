@@ -302,12 +302,15 @@ def inject_live_rssi(nodes: list[dict], connection: dict) -> list[dict]:
     live_rssi = connection.get("rssi", 0)
     live_ch = connection.get("channel", 0)
     live_ssid = connection.get("ssid")
-    # Don't inject when we don't actually have a fresh live reading.
+    # Don't inject when we don't actually have a fresh live reading. If RSSI
+    # was backfilled from the scan cache, publishing it as `liveRssi` would
+    # make the UI treat stale scan data as a 10 Hz live signal.
     if (
         not live_ssid
         or live_ssid == "Unknown"
         or not live_ch
         or not live_rssi
+        or connection.get("rssiSource") != "iface"
     ):
         return nodes
     for node in nodes:
