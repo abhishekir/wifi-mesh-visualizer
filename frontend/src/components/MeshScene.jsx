@@ -515,6 +515,7 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
   const connectedRssi = connection?.rssi ?? null;
   const linkUp = !!connection?.linkUp;
   const ssidInferred = !!connection?.ssidInferred;
+  const hasNodeData = Boolean(meshData?.nodes?.length);
 
   useEffect(() => {
     if (!roamEvents.length) return;
@@ -541,7 +542,11 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
 
   useEffect(() => {
     if (!meshData?.nodes || meshData.nodes.length === 0) {
+      const origin = [0, 0.5, 0];
+      smoothTarget.current = origin;
       setProcessedNodes([]);
+      setUserTarget(origin);
+      setLocalizable(false);
       return;
     }
     const nodes = meshData.nodes;
@@ -716,13 +721,15 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
           history={node.history}
         />
       ))}
-      <UserOrb
-        targetPosition={userTarget}
-        currentRssi={connectedRssi}
-        connectedChannel={connectedChannel}
-        linkUp={linkUp}
-        localizable={localizable}
-      />
+      {hasNodeData && (
+        <UserOrb
+          targetPosition={userTarget}
+          currentRssi={connectedRssi}
+          connectedChannel={connectedChannel}
+          linkUp={linkUp}
+          localizable={localizable}
+        />
+      )}
       <ConnectionLines
         userPos={userTarget}
         nodes={processedNodes}

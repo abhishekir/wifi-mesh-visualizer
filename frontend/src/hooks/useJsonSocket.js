@@ -69,6 +69,7 @@ export default function useJsonSocket(url, { enabled = true, accept } = {}) {
 
       ws.onclose = () => {
         setConnected(false);
+        setData(null);
         if (cancelled || !enabledRef.current) return;
         reconnectTimer = setTimeout(open, RECONNECT_DELAY);
       };
@@ -84,6 +85,7 @@ export default function useJsonSocket(url, { enabled = true, accept } = {}) {
         try { ws.close(); } catch { /* ignore */ }
       }
       setConnected(false);
+      setData(null);
     };
   }, [url, enabled]);
 

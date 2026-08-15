@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -30,7 +31,7 @@ from CoreWLAN import CWWiFiClient
 
 # ── Tunables ────────────────────────────────────────────────────────────
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = int(os.environ.get("WIFI_SERVER_PORT", "8765"))
 SCAN_INTERVAL = 3.0          # seconds between background full scans
 SCAN_STALE_AFTER = 15.0      # cached scan is dropped if older than this
 TERRAIN_HZ = 10
@@ -123,6 +124,13 @@ def poll_wifi() -> dict:
             noise = _iface.noiseMeasurement()
             tx_rate = _iface.transmitRate()
             ssid = _iface.ssid()
+            # BSSID is location-gated on recent macOS releases. Treat it as
+            # optional so a denied permission does not hide otherwise useful
+            # link telemetry.
+            try:
+                bssid = _iface.bssid()
+            except Exception:
+                bssid = None
             ch_obj = _iface.wlanChannel()
             channel = ch_obj.channelNumber() if ch_obj else 0
     except Exception as exc:
@@ -134,6 +142,7 @@ def poll_wifi() -> dict:
         return {
             "linkUp": False,
             "ssid": None,
+            "bssid": None,
             "rssi": 0,
             "noise": 0,
             "snr": 0,
@@ -146,6 +155,7 @@ def poll_wifi() -> dict:
     return {
         "linkUp": True,
         "ssid": ssid,
+        "bssid": str(bssid).lower() if bssid else None,
         "rssi": int(rssi),
         "noise": int(noise),
         # PyObjC may return None on transient errors — guard the float cast.
