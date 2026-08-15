@@ -2,8 +2,15 @@ import { useEffect, useRef, useState } from "react";
 
 const RECONNECT_DELAY = 2000;
 
-const DEFAULT_WS_BASE =
-  import.meta.env.VITE_WS_BASE || "ws://127.0.0.1:8765";
+export function resolveWsBase(env = {}) {
+  return (
+    env.VITE_WS_BASE ||
+    env.VITE_LOCAL_WS_BASE ||
+    "ws://127.0.0.1:8765"
+  );
+}
+
+const DEFAULT_WS_BASE = resolveWsBase(import.meta.env);
 
 export function wsUrl(path) {
   return `${DEFAULT_WS_BASE}${path}`;

@@ -84,6 +84,9 @@ Override the WebSocket origin (when the server isn't on localhost):
 VITE_WS_BASE=ws://192.168.1.42:8765
 ```
 
+This explicit remote origin takes precedence over the local port selected by
+`start.sh`.
+
 Choose a preferred local port or Python executable when launching:
 
 ```bash
@@ -112,10 +115,10 @@ when checking real rooms.
 
 Each result includes median and low-percentile RSSI, SNR, transmit rate,
 signal variation, link-down percentage, serving radio, channel changes, and
-an explicit assessment. A result is marked low confidence when readings are
-scan-backed, the scan cache is stale, too few readings arrive, or the stream
-does not cover most of the capture window. Sessions are stored only in the
-browser's local storage.
+an explicit assessment. A result is marked low confidence when live readings
+are unavailable, scan-backed readings are stale, too few readings arrive, or
+the stream does not cover most of the capture window. Sessions are stored
+only in the browser's local storage.
 
 ## What's useful for debugging mesh failures
 

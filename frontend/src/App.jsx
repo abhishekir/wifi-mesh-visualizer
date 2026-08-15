@@ -75,9 +75,10 @@ function App() {
   const [view, setView] = useState("mesh");
   const [surveyCaptureActive, setSurveyCaptureActive] = useState(false);
   const { data, connected: terrainConnected } = useWifiData(view === "terrain");
-  const { meshData, connected: meshConnected } = useMeshData(
-    view === "mesh" || view === "survey" || surveyCaptureActive
-  );
+  const meshPollingEnabled =
+    view === "mesh" || view === "survey" || surveyCaptureActive;
+  const { meshData, connected: meshConnected } =
+    useMeshData(meshPollingEnabled);
 
   // Roaming events are uniquely identified so consumers can diff by id even
   // when the bounded buffer drops older entries. The 3D marker remains
@@ -88,6 +89,10 @@ function App() {
 
   useEffect(() => {
     const conn = meshData?.connection;
+    if (!meshPollingEnabled) {
+      lastChannelRef.current = null;
+      return;
+    }
     // Missing payload means the collector transport is reconnecting. Keep
     // the last observed channel so the first fresh frame can still reveal a
     // roam that happened during the gap.
@@ -113,10 +118,14 @@ function App() {
       });
     }
     lastChannelRef.current = ch;
-    // Only depend on the fields we actually compare against — re-running for
-    // every connection-object identity change would emit spurious roams.
+    // Only depend on polling state and fields we compare against — re-running
+    // for every connection-object identity change would emit spurious roams.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meshData?.connection?.channel, meshData?.connection?.linkUp]);
+  }, [
+    meshPollingEnabled,
+    meshData?.connection?.channel,
+    meshData?.connection?.linkUp,
+  ]);
 
   return (
     <div style={{ width: "100vw", height: "100vh", background: "#0a0c14" }}>

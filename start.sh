@@ -81,8 +81,8 @@ if [[ "$SERVER_PORT" != "$REQUESTED_PORT" ]]; then
 fi
 
 export WIFI_SERVER_PORT="$SERVER_PORT"
-if [[ -z "${VITE_WS_BASE:-}" ]]; then
-    export VITE_WS_BASE="ws://127.0.0.1:$SERVER_PORT"
+if [[ -z "${VITE_LOCAL_WS_BASE:-}" ]]; then
+    export VITE_LOCAL_WS_BASE="ws://127.0.0.1:$SERVER_PORT"
 fi
 
 echo "Starting Wi-Fi server on ws://127.0.0.1:$SERVER_PORT..."

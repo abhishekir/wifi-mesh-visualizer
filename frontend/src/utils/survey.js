@@ -83,6 +83,7 @@ export function isWithinSurveyWindow(timestamp, startedAt, endedAt) {
 }
 
 export function usableSnr(connection = {}) {
+  if (!connection || typeof connection !== "object") return null;
   const hasRssi = finite(connection.rssi) && connection.rssi !== 0;
   const hasNoise = finite(connection.noise) && connection.noise !== 0;
   return hasRssi &&
@@ -101,14 +102,15 @@ function associationChanges(samples) {
       previous = null;
       continue;
     }
+    if (!sample.bssid && sample.channel == null) continue;
     if (previous) {
-      const bothHaveBssid = previous.bssid && sample.bssid;
-      const neitherHasBssid = !previous.bssid && !sample.bssid;
+      const bothHaveBssid = Boolean(previous.bssid && sample.bssid);
+      const bothHaveChannel =
+        previous.channel != null && sample.channel != null;
       if (
         (bothHaveBssid && previous.bssid !== sample.bssid) ||
-        (neitherHasBssid && previous.channel !== sample.channel) ||
         (!bothHaveBssid &&
-          !neitherHasBssid &&
+          bothHaveChannel &&
           previous.channel !== sample.channel)
       ) {
         changes += 1;
@@ -190,6 +192,7 @@ export function assessSurveyConfidence(metrics) {
 
   if (
     metrics.ifaceSampleCount === 0 ||
+    metrics.ifaceSampleCount < metrics.validRssiSampleCount * 0.2 ||
     metrics.signalSampleCount < 10 ||
     metrics.sampleCoveragePercent <= 50 ||
     metrics.scanStalePercent >= 50
@@ -216,6 +219,19 @@ export function classifySurvey(metrics) {
       level: "no-data",
       label: "No stream data",
       reasons: ["No collector frames arrived during this capture."],
+    };
+  }
+
+  if (
+    finite(metrics.sampleCoveragePercent) &&
+    metrics.sampleCoveragePercent <= 50
+  ) {
+    return {
+      level: "no-data",
+      label: "Incomplete capture",
+      reasons: [
+        `Collector frames covered only ${metrics.sampleCoveragePercent}% of the capture window.`,
+      ],
     };
   }
 
@@ -286,9 +302,10 @@ export function aggregateSurvey(samples, options = {}) {
     (sample) => sample.rssiSource === "iface"
   );
   const scanSamples = withRssi.filter((sample) => sample.rssiSource === "scan");
-  // Prefer truly live readings. Fall back to scan-backed RSSI so a
-  // permission-limited survey still produces a result with low confidence.
-  const signalSamples = ifaceSamples.length > 0 ? ifaceSamples : withRssi;
+  // Every usable reading represents part of the capture window. Source
+  // coverage is reported separately so a stray live frame cannot override
+  // the scan-backed signal observed during the rest of the survey.
+  const signalSamples = withRssi;
   const rssiValues = signalSamples.map((sample) => sample.rssi);
   const startedAt = finite(options.startedAt)
     ? options.startedAt
@@ -297,8 +314,8 @@ export function aggregateSurvey(samples, options = {}) {
     ? options.endedAt
     : ordered.at(-1)?.timestamp ?? startedAt;
   const total = ordered.length;
-  const scanAges = numeric(ordered.map((sample) => sample.scanAge));
-  const staleCount = ordered.filter(
+  const scanAges = numeric(scanSamples.map((sample) => sample.scanAge));
+  const staleScanCount = scanSamples.filter(
     (sample) =>
       sample.scanStale ||
       (finite(sample.scanAge) && sample.scanAge > SCAN_AGE_WARNING_SECONDS)
@@ -322,7 +339,9 @@ export function aggregateSurvey(samples, options = {}) {
     ifaceSampleCount: ifaceSamples.length,
     scanSampleCount: scanSamples.length,
     linkDownPercent: rounded(total ? ((total - connected.length) / total) * 100 : 100),
-    scanStalePercent: rounded(total ? (staleCount / total) * 100 : 0),
+    scanStalePercent: rounded(
+      scanSamples.length ? (staleScanCount / scanSamples.length) * 100 : 0
+    ),
     medianScanAge: rounded(percentile(scanAges, 0.5)),
     maxScanAge: rounded(scanAges.length ? Math.max(...scanAges) : null),
     medianRssi: rounded(percentile(rssiValues, 0.5)),
@@ -407,9 +426,13 @@ export function migrateSurveyState(raw) {
     .filter((session) => session.id);
 
   const sessionIds = new Set(sessions.map((session) => session.id));
-  const activeSessionId = sessionIds.has(source.activeSessionId)
-    ? source.activeSessionId
-    : sessions[0]?.id ?? null;
+  const hasActiveSelection = Object.hasOwn(source, "activeSessionId");
+  const activeSessionId =
+    hasActiveSelection && source.activeSessionId == null
+      ? null
+      : sessionIds.has(source.activeSessionId)
+        ? source.activeSessionId
+        : sessions[0]?.id ?? null;
   const baselineSessionId =
     sessionIds.has(source.baselineSessionId) &&
     source.baselineSessionId !== activeSessionId

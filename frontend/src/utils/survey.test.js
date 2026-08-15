@@ -12,6 +12,7 @@ import {
   sampleFromMeshFrame,
   sessionToCsv,
   SURVEY_STORAGE_VERSION,
+  usableSnr,
 } from "./survey.js";
 
 function reading(overrides = {}) {
@@ -67,6 +68,11 @@ describe("normalizeSurveySessionName", () => {
 });
 
 describe("sampleFromMeshFrame", () => {
+  it("treats null and undefined connection payloads as unavailable", () => {
+    expect(usableSnr(null)).toBeNull();
+    expect(usableSnr(undefined)).toBeNull();
+  });
+
   it("normalizes a mesh frame and lowercases the BSSID", () => {
     const sample = sampleFromMeshFrame({
       timestamp: 12.5,
@@ -172,12 +178,17 @@ describe("aggregateSurvey", () => {
     expect(result.classification.level).toBe("weak");
   });
 
-  it("rates confidence from the live readings actually used", () => {
-    const samples = fullWindow({ rssi: -75, rssiSource: "scan" });
+  it("does not let one live frame override a scan-backed capture", () => {
+    const samples = fullWindow({
+      rssi: -80,
+      rssiSource: "scan",
+      snr: null,
+    });
     samples[99] = {
       ...samples[99],
-      rssi: -55,
+      rssi: -50,
       rssiSource: "iface",
+      snr: 40,
     };
     const result = aggregateSurvey(samples, {
       startedAt: 1_000,
@@ -185,9 +196,10 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.validRssiSampleCount).toBe(100);
-    expect(result.signalSampleCount).toBe(1);
-    expect(result.medianRssi).toBe(-55);
+    expect(result.signalSampleCount).toBe(100);
+    expect(result.medianRssi).toBe(-80);
     expect(result.confidence.level).toBe("low");
+    expect(result.classification.level).toBe("dead-zone");
   });
 
   it("classifies a non-positive SNR as dead-zone risk", () => {
@@ -256,19 +268,38 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.sampleCoveragePercent).toBe(20);
+    expect(result.linkDownPercent).toBe(0);
     expect(result.confidence.level).toBe("low");
     expect(result.confidence.reasons.join(" ")).toContain("expected stream frames");
+    expect(result.classification).toMatchObject({
+      level: "no-data",
+      label: "Incomplete capture",
+    });
   });
 
   it("treats an over-age scan cache as a data-quality warning", () => {
-    const result = aggregateSurvey(fullWindow({ scanAge: 9 }), {
-      startedAt: 1_000,
-      endedAt: 11_000,
-    });
+    const result = aggregateSurvey(
+      fullWindow({ rssiSource: "scan", scanAge: 9 }),
+      {
+        startedAt: 1_000,
+        endedAt: 11_000,
+      }
+    );
 
     expect(result.scanStalePercent).toBe(100);
     expect(result.maxScanAge).toBe(9);
     expect(result.confidence.level).toBe("low");
+  });
+
+  it("does not penalize live RSSI for an unrelated stale scan cache", () => {
+    const result = aggregateSurvey(fullWindow({ scanStale: true }), {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.scanStalePercent).toBe(0);
+    expect(result.medianScanAge).toBeNull();
+    expect(result.confidence.level).toBe("high");
   });
 
   it("counts BSSID and channel association changes without counting outages", () => {
@@ -287,6 +318,23 @@ describe("aggregateSurvey", () => {
     expect(result.associationChanges).toBe(1);
     expect(result.bssids).toEqual(["ap-1", "ap-2", "ap-3"]);
     expect(result.channels).toEqual([36, 149]);
+  });
+
+  it("ignores temporary unknown channels when counting associations", () => {
+    const channels = [36, 36, null, 36, 36];
+    const samples = channels.map((channel, index) =>
+      reading({
+        timestamp: 1_000 + index * 100,
+        bssid: null,
+        channel,
+      })
+    );
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 1_500,
+    });
+
+    expect(result.associationChanges).toBe(0);
   });
 });
 
@@ -343,6 +391,23 @@ describe("survey persistence", () => {
       room: "Kitchen",
       capturedAt: 200,
     });
+  });
+
+  it("preserves an explicitly deselected active session", () => {
+    const migrated = migrateSurveyState({
+      activeSessionId: null,
+      sessions: [
+        {
+          id: "session-1",
+          name: "Home",
+          createdAt: 100,
+          updatedAt: 100,
+          measurements: [],
+        },
+      ],
+    });
+
+    expect(migrated.activeSessionId).toBeNull();
   });
 
   it("merges concurrent measurements by id without losing either tab", () => {
