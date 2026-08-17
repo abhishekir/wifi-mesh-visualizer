@@ -79,6 +79,12 @@ function App() {
     view === "mesh" || view === "survey" || surveyCaptureActive;
   const { meshData, connected: meshConnected } =
     useMeshData(meshPollingEnabled);
+  const meshConnectionPresent = meshData?.connection != null;
+  const meshChannel = meshData?.connection?.channel;
+  const meshCollectorFailed =
+    meshConnectionPresent && Object.hasOwn(meshData.connection, "error");
+  const meshLinkUp = meshData?.connection?.linkUp;
+  const meshNodeCount = meshData?.nodes?.length ?? 0;
 
   // Roaming events are uniquely identified so consumers can diff by id even
   // when the bounded buffer drops older entries. The 3D marker remains
@@ -88,7 +94,6 @@ function App() {
   const lastChannelRef = useRef(null);
 
   useEffect(() => {
-    const conn = meshData?.connection;
     if (!meshPollingEnabled) {
       lastChannelRef.current = null;
       return;
@@ -96,14 +101,19 @@ function App() {
     // Missing payload means the collector transport is reconnecting. Keep
     // the last observed channel so the first fresh frame can still reveal a
     // roam that happened during the gap.
-    if (!conn) return;
-    if (!conn.linkUp) {
+    if (!meshConnectionPresent) return;
+    // A collector exception is an unknown observation, not evidence that the
+    // Wi-Fi association ended.
+    if (meshCollectorFailed) return;
+    if (!meshLinkUp) {
       lastChannelRef.current = null;
       return;
     }
-    const ch = conn.channel;
+    const ch = meshChannel;
+    if (!Number.isFinite(ch) || ch <= 0) return;
     const prevCh = lastChannelRef.current;
-    if (prevCh !== null && ch !== prevCh) {
+    const canPlaceMarker = view === "mesh" && meshNodeCount > 0;
+    if (canPlaceMarker && prevCh !== null && ch !== prevCh) {
       const evt = {
         id: ++roamSeq,
         from: prevCh,
@@ -118,13 +128,16 @@ function App() {
       });
     }
     lastChannelRef.current = ch;
-    // Only depend on polling state and fields we compare against — re-running
+    // Only depend on state and fields we compare against — re-running
     // for every connection-object identity change would emit spurious roams.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     meshPollingEnabled,
-    meshData?.connection?.channel,
-    meshData?.connection?.linkUp,
+    view,
+    meshConnectionPresent,
+    meshChannel,
+    meshCollectorFailed,
+    meshLinkUp,
+    meshNodeCount,
   ]);
 
   return (

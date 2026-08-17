@@ -52,7 +52,9 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
   }
 
   const { nodes, connection, scanStale, scanAge } = meshData;
-  const linkUp = !!connection?.linkUp;
+  const collectorFailed =
+    connection != null && Object.hasOwn(connection, "error");
+  const linkUp = !collectorFailed && !!connection?.linkUp;
   const meshNetworks = nodes.filter((n) => n.isMesh);
   const uniqueSSIDs = [...new Set(nodes.map((n) => n.ssid))];
   const meshSSIDs = [...new Set(meshNetworks.map((n) => n.ssid))];
@@ -84,7 +86,11 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
       {/* Connected network */}
       <div style={styles.section}>
         <div style={styles.sectionTitle}>Connected</div>
-        {linkUp ? (
+        {collectorFailed ? (
+          <div style={styles.offline}>
+            Wi-Fi status unavailable — collector telemetry failed
+          </div>
+        ) : linkUp ? (
           <>
             <div style={styles.row}>
               <span style={styles.label}>SSID</span>

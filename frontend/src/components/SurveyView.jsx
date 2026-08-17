@@ -356,6 +356,8 @@ export default function SurveyView({ meshData, connected, onCaptureChange }) {
     ? Math.max(0, (capture.endsAt - clock) / 1000)
     : 0;
   const connection = connected ? meshData?.connection : null;
+  const collectorFailed =
+    connection != null && Object.hasOwn(connection, "error");
   const liveSnr = usableSnr(connection);
   const canCapture =
     Boolean(activeSession && roomName.trim() && connected && meshData) &&
@@ -402,13 +404,20 @@ export default function SurveyView({ meshData, connected, onCaptureChange }) {
           {captureError}
         </div>
       )}
-      {connection?.rssiSource === "scan" && (
+      {collectorFailed && (
+        <div className="survey-banner survey-banner-danger">
+          Wi-Fi telemetry is temporarily unavailable because the collector
+          reported an error. Captured error frames are excluded from outage
+          scoring.
+        </div>
+      )}
+      {!collectorFailed && connection?.rssiSource === "scan" && (
         <div className="survey-banner survey-banner-warn">
           RSSI is scan-backed. Results will be marked low confidence until
           Location Services is enabled for the terminal running the server.
         </div>
       )}
-      {connected && meshData && !connection?.linkUp && (
+      {connected && meshData && !collectorFailed && !connection?.linkUp && (
         <div className="survey-banner survey-banner-danger">
           Wi-Fi is currently offline. You can still capture this location to
           record the outage.

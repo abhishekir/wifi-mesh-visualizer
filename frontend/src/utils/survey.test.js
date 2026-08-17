@@ -26,6 +26,7 @@ function reading(overrides = {}) {
     txRate: 500,
     channel: 36,
     rssiSource: "iface",
+    collectorError: null,
     scanAge: 1,
     scanStale: false,
     ...overrides,
@@ -107,6 +108,36 @@ describe("sampleFromMeshFrame", () => {
     expect(sample.linkUp).toBe(false);
     expect(sample.rssi).toBeNull();
     expect(sample.channel).toBeNull();
+  });
+
+  it("preserves collector failures separately from link state", () => {
+    const sample = sampleFromMeshFrame({
+      timestamp: 12.5,
+      connection: {
+        linkUp: false,
+        error: "CoreWLAN poll failed",
+      },
+    });
+
+    expect(sample.linkUp).toBe(false);
+    expect(sample.collectorError).toBe("CoreWLAN poll failed");
+  });
+
+  it("recognizes a collector error even when its message is empty", () => {
+    const sample = sampleFromMeshFrame({
+      connection: { linkUp: false, error: "" },
+    });
+    const result = aggregateSurvey(
+      Array.from({ length: 100 }, (_, index) => ({
+        ...sample,
+        timestamp: 1_000 + index * 100,
+      })),
+      { startedAt: 1_000, endedAt: 11_000 }
+    );
+
+    expect(sample.collectorError).toBe("");
+    expect(result.collectorFaultSampleCount).toBe(100);
+    expect(result.linkDownPercent).toBeNull();
   });
 
   it("keeps severe SNR values but drops an unavailable zero sentinel", () => {
@@ -196,10 +227,55 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.validRssiSampleCount).toBe(100);
-    expect(result.signalSampleCount).toBe(100);
+    expect(result.signalSampleCount).toBe(99);
+    expect(result.signalSource).toBe("scan");
     expect(result.medianRssi).toBe(-80);
     expect(result.confidence.level).toBe("low");
     expect(result.classification.level).toBe("dead-zone");
+  });
+
+  it("keeps interface and scan-backed RSSI in representative cohorts", () => {
+    const samples = fullWindow({ rssi: -60 });
+    for (let index = 0; index < 20; index += 1) {
+      samples[index] = {
+        ...samples[index],
+        rssi: -80,
+        rssiSource: "scan",
+        snr: null,
+      };
+    }
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.signalSource).toBe("iface");
+    expect(result.signalSampleCount).toBe(80);
+    expect(result.medianRssi).toBe(-60);
+    expect(result.classification.level).toBe("healthy");
+  });
+
+  it("marks a capture indeterminate when neither RSSI source dominates", () => {
+    const samples = fullWindow({ rssi: -60 });
+    for (let index = 0; index < 40; index += 1) {
+      samples[index] = {
+        ...samples[index],
+        rssi: -80,
+        rssiSource: "scan",
+        snr: null,
+      };
+    }
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.signalSource).toBe("mixed");
+    expect(result.signalSampleCount).toBe(0);
+    expect(result.classification).toMatchObject({
+      level: "no-data",
+      label: "Mixed signal sources",
+    });
   });
 
   it("classifies a non-positive SNR as dead-zone risk", () => {
@@ -261,6 +337,68 @@ describe("aggregateSurvey", () => {
     expect(result.classification.level).toBe("dead-zone");
   });
 
+  it("keeps a confirmed outage even when stream coverage is low", () => {
+    const samples = fullWindow({
+      linkUp: false,
+      rssi: null,
+      snr: null,
+      txRate: null,
+      bssid: null,
+    }).slice(0, 40);
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.sampleCoveragePercent).toBe(40);
+    expect(result.linkDownPercent).toBe(100);
+    expect(result.classification.level).toBe("dead-zone");
+  });
+
+  it("does not count collector faults as Wi-Fi downtime", () => {
+    const samples = fullWindow();
+    for (let index = 0; index < 10; index += 1) {
+      samples[index] = reading({
+        ...samples[index],
+        linkUp: false,
+        rssi: null,
+        snr: null,
+        txRate: null,
+        collectorError: "CoreWLAN poll failed",
+      });
+    }
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.collectorFaultSampleCount).toBe(10);
+    expect(result.linkSampleCount).toBe(90);
+    expect(result.offlineSampleCount).toBe(0);
+    expect(result.linkDownPercent).toBe(0);
+    expect(result.confidence.level).toBe("medium");
+    expect(result.classification.level).toBe("healthy");
+  });
+
+  it("reports collector failures without inventing an outage", () => {
+    const result = aggregateSurvey(
+      fullWindow({
+        linkUp: false,
+        rssi: null,
+        snr: null,
+        txRate: null,
+        collectorError: "CoreWLAN unavailable",
+      }),
+      { startedAt: 1_000, endedAt: 11_000 }
+    );
+
+    expect(result.linkDownPercent).toBeNull();
+    expect(result.classification).toMatchObject({
+      level: "no-data",
+      label: "Collector unavailable",
+    });
+  });
+
   it("downgrades confidence when stream frames are missing", () => {
     const result = aggregateSurvey(fullWindow().slice(0, 20), {
       startedAt: 1_000,
@@ -275,6 +413,20 @@ describe("aggregateSurvey", () => {
       level: "no-data",
       label: "Incomplete capture",
     });
+  });
+
+  it("derives expected cadence from observed frame timing", () => {
+    const samples = Array.from({ length: 20 }, (_, index) =>
+      reading({ timestamp: 1_000 + index * 500 })
+    );
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.expectedSampleHz).toBe(2);
+    expect(result.sampleCoveragePercent).toBe(100);
+    expect(result.classification.level).toBe("healthy");
   });
 
   it("treats an over-age scan cache as a data-quality warning", () => {
@@ -298,7 +450,26 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.scanStalePercent).toBe(0);
-    expect(result.medianScanAge).toBeNull();
+    expect(result.medianScanAge).toBe(1);
+    expect(result.maxScanAge).toBe(1);
+    expect(result.confidence.level).toBe("high");
+  });
+
+  it("weights a stale scan fallback by its share of the capture", () => {
+    const samples = fullWindow();
+    samples[50] = {
+      ...samples[50],
+      rssiSource: "scan",
+      scanStale: true,
+    };
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.scanSampleCount).toBe(1);
+    expect(result.scanStalePercent).toBe(1);
+    expect(result.signalSource).toBe("iface");
     expect(result.confidence.level).toBe("high");
   });
 
@@ -336,6 +507,22 @@ describe("aggregateSurvey", () => {
 
     expect(result.associationChanges).toBe(0);
   });
+
+  it("counts a channel roam even when the BSSID string is unchanged", () => {
+    const samples = [149, 149, 36, 36].map((channel, index) =>
+      reading({
+        timestamp: 1_000 + index * 100,
+        bssid: "aa:bb:cc:dd:ee:ff",
+        channel,
+      })
+    );
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 1_400,
+    });
+
+    expect(result.associationChanges).toBe(1);
+  });
 });
 
 describe("classifySurvey", () => {
@@ -367,6 +554,31 @@ describe("survey persistence", () => {
     expect(decoded.blocked).toBe(true);
     expect(decoded.error).toContain("left untouched");
     expect(decoded.state.sessions).toEqual([]);
+  });
+
+  it("preserves valid JSON with an unrecognized storage shape", () => {
+    const decoded = decodeSurveyStorage(
+      JSON.stringify({
+        version: SURVEY_STORAGE_VERSION,
+        session: { id: "session-1", measurements: [] },
+      })
+    );
+
+    expect(decoded.blocked).toBe(true);
+    expect(decoded.error).toContain("unrecognized structure");
+    expect(decoded.state.sessions).toEqual([]);
+  });
+
+  it("does not overwrite storage from a newer schema version", () => {
+    const decoded = decodeSurveyStorage(
+      JSON.stringify({
+        version: SURVEY_STORAGE_VERSION + 1,
+        sessions: [],
+      })
+    );
+
+    expect(decoded.blocked).toBe(true);
+    expect(decoded.error).toContain("unsupported version");
   });
 
   it("migrates legacy session samples and repairs invalid active ids", () => {
@@ -408,6 +620,34 @@ describe("survey persistence", () => {
     });
 
     expect(migrated.activeSessionId).toBeNull();
+  });
+
+  it("preserves explicit null selections during cross-tab merges", () => {
+    const deselected = {
+      version: SURVEY_STORAGE_VERSION,
+      sessions: [
+        {
+          id: "session-1",
+          name: "Home",
+          createdAt: 100,
+          updatedAt: 100,
+          nameUpdatedAt: 100,
+          measurements: [],
+        },
+      ],
+      activeSessionId: null,
+      baselineSessionId: null,
+      deletedSessionIds: [],
+      deletedMeasurementIds: [],
+    };
+
+    const merged = mergeSurveyStates(deselected, {
+      ...deselected,
+      activeSessionId: "session-1",
+    });
+
+    expect(merged.activeSessionId).toBeNull();
+    expect(merged.baselineSessionId).toBeNull();
   });
 
   it("merges concurrent measurements by id without losing either tab", () => {
@@ -517,6 +757,35 @@ describe("survey persistence", () => {
 
     expect(merged.sessions[0].measurements).toEqual([]);
     expect(merged.deletedMeasurementIds).toEqual(["run-old"]);
+  });
+
+  it("bounds deletion tombstones so storage cannot grow indefinitely", () => {
+    const deletedMeasurementIds = Array.from(
+      { length: 1_005 },
+      (_, index) => `run-${String(index).padStart(4, "0")}`
+    );
+    const migrated = migrateSurveyState({
+      sessions: [],
+      deletedMeasurementIds,
+    });
+
+    expect(migrated.deletedMeasurementIds).toHaveLength(1_000);
+  });
+
+  it("retains a newly appended tombstone when the cap is reached", () => {
+    const deletedMeasurementIds = Array.from(
+      { length: 1_000 },
+      (_, index) => `z-old-${String(index).padStart(4, "0")}`
+    );
+    deletedMeasurementIds.push("a-new-deletion");
+    const migrated = migrateSurveyState({
+      sessions: [],
+      deletedMeasurementIds,
+      deletedMeasurementTimestamps: { "a-new-deletion": 1_000 },
+    });
+
+    expect(migrated.deletedMeasurementIds).toContain("a-new-deletion");
+    expect(migrated.deletedMeasurementIds).toHaveLength(1_000);
   });
 
   it("applies stored session tombstones before a stale tab writes", () => {

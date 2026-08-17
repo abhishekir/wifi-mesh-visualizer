@@ -50,14 +50,28 @@ export default function useSurveySessions() {
     try {
       const storage = globalThis.localStorage;
       const stored = storage?.getItem(STORAGE_KEY);
+      const decoded = decodeSurveyStorage(stored);
+      if (decoded.blocked) {
+        setStorageError(decoded.error);
+        setStorageBlocked(true);
+        return;
+      }
       const nextState =
         stored == null
-          ? state
-          : mergeSurveyStatesForPersistence(state, JSON.parse(stored));
+          ? migrateSurveyState(state)
+          : mergeSurveyStatesForPersistence(state, decoded.state);
       const serialized = JSON.stringify(nextState);
       storage?.setItem(STORAGE_KEY, serialized);
       if (serialized !== JSON.stringify(state)) {
-        setState(nextState);
+        setState((current) => {
+          const merged =
+            stored == null
+              ? migrateSurveyState(current)
+              : mergeSurveyStatesForPersistence(current, decoded.state);
+          return JSON.stringify(merged) === JSON.stringify(current)
+            ? current
+            : merged;
+        });
       }
       setPersistedState(nextState);
       setStorageError(null);
@@ -67,7 +81,6 @@ export default function useSurveySessions() {
           error instanceof Error ? error.message : String(error)
         }`
       );
-      setStorageBlocked(true);
     }
   }, [state, storageBlocked]);
 
@@ -75,27 +88,29 @@ export default function useSurveySessions() {
     function handleStorage(event) {
       if (event.key !== STORAGE_KEY) return;
       if (event.newValue == null) {
-        setState(migrateSurveyState(null));
+        const empty = migrateSurveyState(null);
+        setState(empty);
+        setPersistedState(empty);
         setStorageError(null);
         setStorageBlocked(false);
         return;
       }
-      try {
-        const incoming = JSON.parse(event.newValue);
-        setState((current) => {
-          const merged = mergeSurveyStates(current, incoming);
-          return JSON.stringify(merged) === JSON.stringify(current)
-            ? current
-            : merged;
-        });
-        setStorageError(null);
-        setStorageBlocked(false);
-      } catch {
+      const decoded = decodeSurveyStorage(event.newValue);
+      if (decoded.blocked) {
         setStorageError(
           "Survey history changed in another tab but could not be read. The stored value was left untouched."
         );
         setStorageBlocked(true);
+        return;
       }
+      setState((current) => {
+        const merged = mergeSurveyStates(current, decoded.state);
+        return JSON.stringify(merged) === JSON.stringify(current)
+          ? current
+          : merged;
+      });
+      setStorageError(null);
+      setStorageBlocked(false);
     }
 
     globalThis.addEventListener?.("storage", handleStorage);
@@ -105,7 +120,9 @@ export default function useSurveySessions() {
   const resetStorage = useCallback(() => {
     try {
       globalThis.localStorage?.removeItem(STORAGE_KEY);
-      setState(migrateSurveyState(null));
+      const empty = migrateSurveyState(null);
+      setState(empty);
+      setPersistedState(empty);
       setStorageError(null);
       setStorageBlocked(false);
     } catch (error) {
@@ -207,25 +224,33 @@ export default function useSurveySessions() {
   }, []);
 
   const deleteMeasurement = useCallback((sessionId, measurementId) => {
-    setState((current) => ({
-      ...current,
-      deletedMeasurementIds: current.deletedMeasurementIds.includes(
-        measurementId
-      )
-        ? current.deletedMeasurementIds
-        : [...current.deletedMeasurementIds, measurementId].sort(),
-      sessions: current.sessions.map((session) =>
-        session.id === sessionId
-          ? {
-              ...session,
-              updatedAt: Date.now(),
-              measurements: session.measurements.filter(
-                (measurement) => measurement.id !== measurementId
-              ),
-            }
-          : session
-      ),
-    }));
+    setState((current) => {
+      const alreadyDeleted =
+        current.deletedMeasurementIds.includes(measurementId);
+      return {
+        ...current,
+        deletedMeasurementIds: alreadyDeleted
+          ? current.deletedMeasurementIds
+          : [...current.deletedMeasurementIds, measurementId],
+        deletedMeasurementTimestamps: alreadyDeleted
+          ? current.deletedMeasurementTimestamps
+          : {
+              ...current.deletedMeasurementTimestamps,
+              [measurementId]: Date.now(),
+            },
+        sessions: current.sessions.map((session) =>
+          session.id === sessionId
+            ? {
+                ...session,
+                updatedAt: Date.now(),
+                measurements: session.measurements.filter(
+                  (measurement) => measurement.id !== measurementId
+                ),
+              }
+            : session
+        ),
+      };
+    });
   }, []);
 
   const deleteSession = useCallback((sessionId) => {
@@ -237,13 +262,20 @@ export default function useSurveySessions() {
         current.activeSessionId === sessionId
           ? sessions[0]?.id ?? null
           : current.activeSessionId;
+      const alreadyDeleted = current.deletedSessionIds.includes(sessionId);
       return {
         ...current,
         sessions,
         activeSessionId,
-        deletedSessionIds: current.deletedSessionIds.includes(sessionId)
+        deletedSessionIds: alreadyDeleted
           ? current.deletedSessionIds
-          : [...current.deletedSessionIds, sessionId].sort(),
+          : [...current.deletedSessionIds, sessionId],
+        deletedSessionTimestamps: alreadyDeleted
+          ? current.deletedSessionTimestamps
+          : {
+              ...current.deletedSessionTimestamps,
+              [sessionId]: Date.now(),
+            },
         baselineSessionId:
           current.baselineSessionId === sessionId ||
           current.baselineSessionId === activeSessionId

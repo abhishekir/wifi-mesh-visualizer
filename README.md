@@ -32,7 +32,8 @@ cd frontend && npm install && cd ..
 
 `start.sh` boots the Python server on `ws://127.0.0.1:8765` and opens the
 React UI only after the server is listening. If port 8765 is occupied, the
-launcher selects the next available port and configures the UI automatically.
+server asks the OS for an available port and reports it to the launcher, which
+configures the UI automatically.
 
 ## Architecture
 

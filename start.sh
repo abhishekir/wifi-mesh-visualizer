@@ -9,6 +9,7 @@ PYTHON_BIN="${PYTHON:-python3}"
 REQUESTED_PORT="${WIFI_SERVER_PORT:-8765}"
 SERVER_PID=""
 FRONTEND_PID=""
+PORT_FILE=""
 
 cleanup() {
     local status="${1:-0}"
@@ -19,6 +20,7 @@ cleanup() {
     [[ -n "$FRONTEND_PID" ]] && kill "$FRONTEND_PID" 2>/dev/null
     [[ -n "$SERVER_PID" ]] && wait "$SERVER_PID" 2>/dev/null
     [[ -n "$FRONTEND_PID" ]] && wait "$FRONTEND_PID" 2>/dev/null
+    [[ -n "$PORT_FILE" ]] && rm -f "$PORT_FILE"
     echo "Done."
     exit "$status"
 }
@@ -29,67 +31,36 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     exit 1
 fi
 
-find_available_port() {
+validate_port() {
     "$PYTHON_BIN" - "$1" <<'PY'
-import socket
 import sys
 
 try:
-    start = int(sys.argv[1])
+    port = int(sys.argv[1])
 except ValueError:
     print(f"Invalid WIFI_SERVER_PORT: {sys.argv[1]}", file=sys.stderr)
     raise SystemExit(2)
 
-if not 1 <= start <= 65535:
-    print(f"WIFI_SERVER_PORT must be between 1 and 65535: {start}", file=sys.stderr)
+if not 1 <= port <= 65535:
+    print(f"WIFI_SERVER_PORT must be between 1 and 65535: {port}", file=sys.stderr)
     raise SystemExit(2)
-
-for port in range(start, min(start + 100, 65536)):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        try:
-            sock.bind(("127.0.0.1", port))
-        except OSError:
-            continue
-    print(port)
-    break
-else:
-    print(f"No available port found from {start} through {min(start + 99, 65535)}", file=sys.stderr)
-    raise SystemExit(1)
 PY
 }
 
-server_ready() {
-    "$PYTHON_BIN" - "$1" <<'PY'
-import socket
-import sys
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-    try:
-        sock.bind(("127.0.0.1", int(sys.argv[1])))
-    except OSError:
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-SERVER_PORT="$(find_available_port "$REQUESTED_PORT")"
-if [[ -z "$SERVER_PORT" ]]; then
+if ! validate_port "$REQUESTED_PORT"; then
     exit 1
 fi
-if [[ "$SERVER_PORT" != "$REQUESTED_PORT" ]]; then
-    echo "Port $REQUESTED_PORT is already in use; using $SERVER_PORT instead."
-fi
 
-export WIFI_SERVER_PORT="$SERVER_PORT"
-if [[ -z "${VITE_LOCAL_WS_BASE:-}" ]]; then
-    export VITE_LOCAL_WS_BASE="ws://127.0.0.1:$SERVER_PORT"
-fi
+PORT_FILE="$(mktemp "${TMPDIR:-/tmp}/wifi-mesh-port.XXXXXX")" || exit 1
+export WIFI_SERVER_PORT="$REQUESTED_PORT"
+export WIFI_SERVER_PORT_FILE="$PORT_FILE"
 
-echo "Starting Wi-Fi server on ws://127.0.0.1:$SERVER_PORT..."
+echo "Starting Wi-Fi server..."
 "$PYTHON_BIN" "$DIR/server.py" &
 SERVER_PID=$!
 
 SERVER_READY=0
+SERVER_PORT=""
 ATTEMPT=0
 while [[ "$ATTEMPT" -lt 150 ]]; do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -98,9 +69,10 @@ while [[ "$ATTEMPT" -lt 150 ]]; do
         SERVER_PID=""
         [[ "$SERVER_STATUS" -eq 0 ]] && SERVER_STATUS=1
         echo "Wi-Fi server failed to start; frontend was not opened." >&2
-        exit "$SERVER_STATUS"
+        cleanup "$SERVER_STATUS"
     fi
-    if server_ready "$SERVER_PORT"; then
+    if [[ -s "$PORT_FILE" ]]; then
+        SERVER_PORT="$(<"$PORT_FILE")"
         SERVER_READY=1
         break
     fi
@@ -112,6 +84,16 @@ if [[ "$SERVER_READY" -ne 1 ]]; then
     echo "Wi-Fi server did not become ready within 30 seconds." >&2
     cleanup 1
 fi
+
+if [[ "$SERVER_PORT" != "$REQUESTED_PORT" ]]; then
+    echo "Port $REQUESTED_PORT is already in use; using $SERVER_PORT instead."
+fi
+if [[ -z "${VITE_LOCAL_WS_BASE:-}" ]]; then
+    export VITE_LOCAL_WS_BASE="ws://127.0.0.1:$SERVER_PORT"
+fi
+unset WIFI_SERVER_PORT_FILE
+rm -f "$PORT_FILE"
+PORT_FILE=""
 
 echo "Starting frontend..."
 ( cd "$DIR/frontend" && npx vite --open ) &
