@@ -12,6 +12,9 @@ debugging roaming, signal hand-offs, and dead spots.
   mesh's BSSIDs. Channel changes drop roam markers on the floor so you can
   see where in the room hand-offs are happening. A persistent ground heatmap
   is painted under your feet as you walk.
+- **Survey view** — record repeatable 10-second samples in named rooms, rank
+  weak locations, compare against an earlier session, and export JSON or CSV
+  evidence.
 
 ## Requirements
 
@@ -28,7 +31,9 @@ cd frontend && npm install && cd ..
 ```
 
 `start.sh` boots the Python server on `ws://127.0.0.1:8765` and opens the
-React UI in your browser.
+React UI only after the server is listening. If port 8765 is occupied, the
+server asks the OS for an available port and reports it to the launcher, which
+configures the UI automatically.
 
 ## Architecture
 
@@ -61,11 +66,12 @@ on either:
    restart needed.
 2. **Running the server as root** (`sudo python3 server.py`).
 
-Without either, the iface reports rssi=0. The server back-fills from the
-latest scan when it can match by SSID — you'll see a `~scan` badge next to
-the signal value in the terrain HUD. If the connected SSID is also hidden,
-the link RSSI shows as "Unknown" rather than risk picking a neighbouring
-AP's RSSI on the same channel.
+Without either, the iface reports rssi=0 and may hide the connected BSSID.
+The server back-fills RSSI from the latest scan when it can match by SSID —
+you'll see a `~scan` badge next to the signal value in the terrain HUD, and
+surveys will be marked low confidence. If the connected SSID is also hidden,
+the link RSSI shows as "Unknown" rather than risk picking a neighbouring AP's
+RSSI on the same channel.
 
 The mesh view works either way — `scanForNetworksWithName_error_` does not
 require elevation.
@@ -79,6 +85,42 @@ Override the WebSocket origin (when the server isn't on localhost):
 VITE_WS_BASE=ws://192.168.1.42:8765
 ```
 
+This explicit remote origin takes precedence over the local port selected by
+`start.sh`.
+
+Choose a preferred local port or Python executable when launching:
+
+```bash
+WIFI_SERVER_PORT=9000 PYTHON=/path/to/python3 ./start.sh
+```
+
+## Run a room survey
+
+The 3D mesh floor is useful for relative movement, but it is not a floor
+plan: AP positions are generated for display and distance uses a generic
+indoor path-loss model. Use named Survey locations as the source of truth
+when checking real rooms.
+
+1. Enable Location Services for the terminal running the server so the
+   survey receives live RSSI and, when macOS exposes it, the serving BSSID.
+2. Open **Survey**, create a session such as `Before moving satellite`, and
+   enter a room or location name.
+3. Stand still and record a 10-second sample. Start with the place where
+   Wi-Fi feels weakest and repeat questionable rooms to account for doors,
+   people, and appliance interference.
+4. Create another session after changing node placement or settings. Select
+   the earlier session under **Compare against** to see the per-room median
+   RSSI change.
+5. Export JSON for complete structured results or CSV for a spreadsheet.
+   Exports may contain the local SSID and BSSIDs.
+
+Each result includes median and low-percentile RSSI, SNR, transmit rate,
+signal variation, link-down percentage, serving radio, channel changes, and
+an explicit assessment. A result is marked low confidence when live readings
+are unavailable, scan-backed readings are stale, too few readings arrive, or
+the stream does not cover most of the capture window. Sessions are stored
+only in the browser's local storage.
+
 ## What's useful for debugging mesh failures
 
 1. **Roam markers** — every channel change is logged with the position where
@@ -91,3 +133,5 @@ VITE_WS_BASE=ws://192.168.1.42:8765
 4. **Connection beam** — drops when the link goes down even if the SSID
    doesn't change; useful for spotting sub-second drops the OS hides.
 5. **Heatmap** — running-average per cell, walk around to map dead spots.
+6. **Room survey** — ranks named locations using repeatable signal and link
+   stability measurements instead of inferred 3D coordinates.

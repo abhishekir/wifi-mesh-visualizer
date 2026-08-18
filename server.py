@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -30,7 +32,8 @@ from CoreWLAN import CWWiFiClient
 
 # ── Tunables ────────────────────────────────────────────────────────────
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = int(os.environ.get("WIFI_SERVER_PORT", "8765"))
+PORT_FILE = os.environ.get("WIFI_SERVER_PORT_FILE")
 SCAN_INTERVAL = 3.0          # seconds between background full scans
 SCAN_STALE_AFTER = 15.0      # cached scan is dropped if older than this
 TERRAIN_HZ = 10
@@ -123,6 +126,13 @@ def poll_wifi() -> dict:
             noise = _iface.noiseMeasurement()
             tx_rate = _iface.transmitRate()
             ssid = _iface.ssid()
+            # BSSID is location-gated on recent macOS releases. Treat it as
+            # optional so a denied permission does not hide otherwise useful
+            # link telemetry.
+            try:
+                bssid = _iface.bssid()
+            except Exception:
+                bssid = None
             ch_obj = _iface.wlanChannel()
             channel = ch_obj.channelNumber() if ch_obj else 0
     except Exception as exc:
@@ -134,6 +144,7 @@ def poll_wifi() -> dict:
         return {
             "linkUp": False,
             "ssid": None,
+            "bssid": None,
             "rssi": 0,
             "noise": 0,
             "snr": 0,
@@ -146,6 +157,7 @@ def poll_wifi() -> dict:
     return {
         "linkUp": True,
         "ssid": ssid,
+        "bssid": str(bssid).lower() if bssid else None,
         "rssi": int(rssi),
         "noise": int(noise),
         # PyObjC may return None on transient errors — guard the float cast.
@@ -330,6 +342,7 @@ def _build_mesh_payload() -> dict:
     return {
         "nodes": nodes,
         "connection": connection,
+        "meshHz": MESH_HZ,
         "scanAge": (time.time() - cached_at) if cached_at else None,
         "scanStale": cached_at == 0.0,
         "timestamp": time.time(),
@@ -437,32 +450,54 @@ async def handler(websocket, path=None):
 # ────────────────────────────────────────────────────────────────────────
 
 async def main():
-    threading.Thread(target=scanner_loop, daemon=True).start()
-    log.info("background scanner started (interval=%.1fs)", SCAN_INTERVAL)
+    try:
+        server = await websockets.serve(handler, HOST, PORT)
+    except OSError as exc:
+        if not PORT_FILE or PORT == 0 or exc.errno != errno.EADDRINUSE:
+            raise
+        log.warning("port %d is in use; requesting an available port", PORT)
+        server = await websockets.serve(handler, HOST, 0)
 
-    # Warm cache so the first /mesh client sees data immediately.
-    initial = await asyncio.to_thread(scan_networks)
-    if initial:
-        global _cached_nodes, _cached_at
-        with _cache_lock:
-            _cached_nodes = initial
-            _cached_at = time.time()
-        log.info("initial scan: %d APs", len(initial))
-    else:
-        log.warning("initial scan returned 0 APs")
+    actual_port = server.sockets[0].getsockname()[1]
+    if PORT_FILE:
+        with open(PORT_FILE, "w", encoding="utf-8") as port_file:
+            port_file.write(str(actual_port))
 
-    terrain_task = asyncio.create_task(producer(terrain_bus, get_current_connection, TERRAIN_HZ))
-    mesh_task = asyncio.create_task(producer(mesh_bus, _build_mesh_payload, MESH_HZ))
+    log.info("Wi-Fi Visualizer server running on ws://%s:%d", HOST, actual_port)
+    log.info("  /terrain  (signal terrain, %d Hz)", TERRAIN_HZ)
+    log.info("  /mesh     (mesh scanner, %d Hz)", MESH_HZ)
 
-    async with websockets.serve(handler, HOST, PORT):
-        log.info("Wi-Fi Visualizer server running on ws://%s:%d", HOST, PORT)
-        log.info("  /terrain  (signal terrain, %d Hz)", TERRAIN_HZ)
-        log.info("  /mesh     (mesh scanner, %d Hz)", MESH_HZ)
-        try:
-            await asyncio.Future()
-        finally:
-            terrain_task.cancel()
-            mesh_task.cancel()
+    tasks = []
+    try:
+        # Warm cache so the first /mesh payload contains current scan data.
+        initial = await asyncio.to_thread(scan_networks)
+        if initial:
+            global _cached_nodes, _cached_at
+            with _cache_lock:
+                _cached_nodes = initial
+                _cached_at = time.time()
+            log.info("initial scan: %d APs", len(initial))
+        else:
+            log.warning("initial scan returned 0 APs")
+
+        threading.Thread(target=scanner_loop, daemon=True).start()
+        log.info("background scanner started (interval=%.1fs)", SCAN_INTERVAL)
+        tasks = [
+            asyncio.create_task(
+                producer(terrain_bus, get_current_connection, TERRAIN_HZ)
+            ),
+            asyncio.create_task(
+                producer(mesh_bus, _build_mesh_payload, MESH_HZ)
+            ),
+        ]
+        await asyncio.Future()
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
 
 
 if __name__ == "__main__":

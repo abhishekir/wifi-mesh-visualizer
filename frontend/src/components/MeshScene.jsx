@@ -198,7 +198,14 @@ const APNodeMemo = memo(APNode, (prev, next) => {
 });
 
 // ── User orb + trail ────────────────────────────────────────────────────
-function UserOrb({ targetPosition, currentRssi, connectedChannel, linkUp, localizable = true }) {
+function UserOrb({
+  targetPosition,
+  currentRssi,
+  connectedChannel,
+  linkUp,
+  collectorFailed = false,
+  localizable = true,
+}) {
   const groupRef = useRef();
   const currentPos = useRef(new THREE.Vector3(0, 0.5, 0));
   const ringRef = useRef();
@@ -251,7 +258,7 @@ function UserOrb({ targetPosition, currentRssi, connectedChannel, linkUp, locali
     }
   });
 
-  const orbColor = linkUp ? "#4488ff" : "#ff3333";
+  const orbColor = collectorFailed ? "#888888" : linkUp ? "#4488ff" : "#ff3333";
 
   return (
     <>
@@ -298,7 +305,18 @@ function UserOrb({ targetPosition, currentRssi, connectedChannel, linkUp, locali
               no localization target
             </Text>
           )}
-          {!linkUp && (
+          {collectorFailed && (
+            <Text
+              fontSize={0.12}
+              color="#bbbbbb"
+              anchorX="center"
+              anchorY="top"
+              position={[0, -0.05, 0]}
+            >
+              STATUS UNKNOWN
+            </Text>
+          )}
+          {!linkUp && !collectorFailed && (
             <Text
               fontSize={0.12}
               color="#ff8888"
@@ -489,7 +507,10 @@ function GridFloor() {
 export default function MeshScene({ meshData, roamEvents = [] }) {
   const [processedNodes, setProcessedNodes] = useState([]);
   const [userTarget, setUserTarget] = useState([0, 0.5, 0]);
-  const [localizable, setLocalizable] = useState(false);
+  const [localization, setLocalization] = useState({
+    localizable: false,
+    frame: null,
+  });
   const smoothTarget = useRef([0, 0.5, 0]);
   const layoutRef = useRef(new Map());
 
@@ -507,14 +528,28 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
   // Lift positioned roam events to state so the scene actually re-renders
   // when a roam fires between mesh frames.
   const [positionedRoamEvents, setPositionedRoamEvents] = useState([]);
-  const seenRoamIds = useRef(new Set());
+  // Events already present when the scene mounts happened while it had no
+  // position context. Do not fabricate coordinates for them.
+  const seenRoamIds = useRef(new Set(roamEvents.map((event) => event.id)));
 
   const connection = meshData?.connection ?? null;
   const connectedSSID = connection?.ssid ?? "";
   const connectedChannel = connection?.channel ?? 0;
   const connectedRssi = connection?.rssi ?? null;
-  const linkUp = !!connection?.linkUp;
+  const collectorFailed =
+    connection != null && Object.hasOwn(connection, "error");
+  const linkUp = !collectorFailed && !!connection?.linkUp;
   const ssidInferred = !!connection?.ssidInferred;
+  const hasNodeData = Boolean(meshData?.nodes?.length);
+  const hasLocalizationTarget =
+    hasNodeData &&
+    Boolean(connectedSSID) &&
+    meshData.nodes.some((node) => node.ssid === connectedSSID);
+  const localizable = localization.localizable;
+  const currentFrameLocalized =
+    hasLocalizationTarget &&
+    localizable &&
+    localization.frame === meshData;
 
   useEffect(() => {
     if (!roamEvents.length) return;
@@ -527,6 +562,11 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
     }
     const fresh = roamEvents.filter((e) => !seenRoamIds.current.has(e.id));
     if (!fresh.length) return;
+    if (!hasLocalizationTarget) {
+      for (const e of fresh) seenRoamIds.current.add(e.id);
+      return;
+    }
+    if (!currentFrameLocalized) return;
     for (const e of fresh) seenRoamIds.current.add(e.id);
     const stamped = fresh.map((e) => ({
       ...e,
@@ -537,11 +577,12 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
       const next = prev.concat(stamped);
       return next.length > 20 ? next.slice(next.length - 20) : next;
     });
-  }, [roamEvents]);
+  }, [roamEvents, hasLocalizationTarget, currentFrameLocalized]);
 
   useEffect(() => {
     if (!meshData?.nodes || meshData.nodes.length === 0) {
       setProcessedNodes([]);
+      setLocalization({ localizable: false, frame: null });
       return;
     }
     const nodes = meshData.nodes;
@@ -639,7 +680,7 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
     // actually attached to. Falling back to "top N strongest neighbours"
     // produces a position the user can't act on — they'd see the puck move
     // when an unrelated AP's RSSI fluctuated. When no target set exists,
-    // ease the puck back to the origin and surface the state to the HUD.
+    // preserve the last localized position and surface the state to the HUD.
     const meshNodes = connectedSSID
       ? positioned.filter((n) => n.ssid === connectedSSID)
       : [];
@@ -676,10 +717,10 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
         0.5,
         pScan[2] + dz * factor,
       ];
-      setLocalizable(true);
+      setLocalization({ localizable: true, frame: meshData });
     } else {
-      raw = [0, 0.5, 0];
-      setLocalizable(false);
+      raw = smoothTarget.current;
+      setLocalization({ localizable: false, frame: null });
     }
 
     const prev = smoothTarget.current;
@@ -698,7 +739,12 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
   return (
     <>
       <GridFloor />
-      <GroundHeatmap userPos={userTarget} rssi={linkUp ? connectedRssi : null} />
+      <GroundHeatmap
+        userPos={userTarget}
+        rssi={
+          currentFrameLocalized && linkUp ? connectedRssi : null
+        }
+      />
       <RoamingMarkers events={positionedRoamEvents} />
       {processedNodes.map((node) => (
         <APNodeMemo
@@ -716,13 +762,16 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
           history={node.history}
         />
       ))}
-      <UserOrb
-        targetPosition={userTarget}
-        currentRssi={connectedRssi}
-        connectedChannel={connectedChannel}
-        linkUp={linkUp}
-        localizable={localizable}
-      />
+      {hasNodeData && (
+        <UserOrb
+          targetPosition={userTarget}
+          currentRssi={connectedRssi}
+          connectedChannel={connectedChannel}
+          linkUp={linkUp}
+          collectorFailed={collectorFailed}
+          localizable={localizable}
+        />
+      )}
       <ConnectionLines
         userPos={userTarget}
         nodes={processedNodes}

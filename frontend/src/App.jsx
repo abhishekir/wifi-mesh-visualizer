@@ -5,6 +5,7 @@ import WifiTerrain from "./components/WifiTerrain";
 import SignalHUD from "./components/SignalHUD";
 import MeshScene from "./components/MeshScene";
 import MeshHUD from "./components/MeshHUD";
+import SurveyView from "./components/SurveyView";
 import useWifiData from "./hooks/useWifiData";
 import useMeshData from "./hooks/useMeshData";
 import "./App.css";
@@ -72,25 +73,47 @@ let roamSeq = 0;
 
 function App() {
   const [view, setView] = useState("mesh");
+  const [surveyCaptureActive, setSurveyCaptureActive] = useState(false);
   const { data, connected: terrainConnected } = useWifiData(view === "terrain");
-  const { meshData, connected: meshConnected } = useMeshData(view === "mesh");
+  const meshPollingEnabled =
+    view === "mesh" || view === "survey" || surveyCaptureActive;
+  const { meshData, connected: meshConnected } =
+    useMeshData(meshPollingEnabled);
+  const meshConnectionPresent = meshData?.connection != null;
+  const meshChannel = meshData?.connection?.channel;
+  const meshCollectorFailed =
+    meshConnectionPresent && Object.hasOwn(meshData.connection, "error");
+  const meshLinkUp = meshData?.connection?.linkUp;
+  const meshNodeCount = meshData?.nodes?.length ?? 0;
 
   // Roaming events are uniquely identified so consumers can diff by id even
-  // when the bounded buffer drops older entries. (The server only exposes
-  // channel + SSID for the live connection, not BSSID, so we detect roams
-  // off channel changes alone.)
+  // when the bounded buffer drops older entries. The 3D marker remains
+  // channel-based; room surveys independently record BSSID association
+  // changes when macOS exposes them.
   const [roamEvents, setRoamEvents] = useState([]);
   const lastChannelRef = useRef(null);
 
   useEffect(() => {
-    const conn = meshData?.connection;
-    if (!conn || !conn.linkUp) {
+    if (!meshPollingEnabled) {
       lastChannelRef.current = null;
       return;
     }
-    const ch = conn.channel;
+    // Missing payload means the collector transport is reconnecting. Keep
+    // the last observed channel so the first fresh frame can still reveal a
+    // roam that happened during the gap.
+    if (!meshConnectionPresent) return;
+    // A collector exception is an unknown observation, not evidence that the
+    // Wi-Fi association ended.
+    if (meshCollectorFailed) return;
+    if (!meshLinkUp) {
+      lastChannelRef.current = null;
+      return;
+    }
+    const ch = meshChannel;
+    if (!Number.isFinite(ch) || ch <= 0) return;
     const prevCh = lastChannelRef.current;
-    if (prevCh !== null && ch !== prevCh) {
+    const canPlaceMarker = view === "mesh" && meshNodeCount > 0;
+    if (canPlaceMarker && prevCh !== null && ch !== prevCh) {
       const evt = {
         id: ++roamSeq,
         from: prevCh,
@@ -105,69 +128,114 @@ function App() {
       });
     }
     lastChannelRef.current = ch;
-    // Only depend on the fields we actually compare against — re-running for
-    // every connection-object identity change would emit spurious roams.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meshData?.connection?.channel, meshData?.connection?.linkUp]);
+    // Only depend on state and fields we compare against — re-running
+    // for every connection-object identity change would emit spurious roams.
+  }, [
+    meshPollingEnabled,
+    view,
+    meshConnectionPresent,
+    meshChannel,
+    meshCollectorFailed,
+    meshLinkUp,
+    meshNodeCount,
+  ]);
 
   return (
     <div style={{ width: "100vw", height: "100vh", background: "#0a0c14" }}>
       <div style={styles.toggle}>
         <button
           onClick={() => setView("terrain")}
-          style={view === "terrain" ? styles.btnActive : styles.btn}
+          style={
+            view === "terrain"
+              ? styles.btnActive
+              : surveyCaptureActive
+                ? { ...styles.btn, ...styles.btnDisabled }
+                : styles.btn
+          }
+          disabled={surveyCaptureActive}
+          title={
+            surveyCaptureActive
+              ? "Finish or cancel the room sample before switching views"
+              : undefined
+          }
         >
           Terrain
         </button>
         <button
           onClick={() => setView("mesh")}
-          style={view === "mesh" ? styles.btnActive : styles.btn}
+          style={
+            view === "mesh"
+              ? styles.btnActive
+              : surveyCaptureActive
+                ? { ...styles.btn, ...styles.btnDisabled }
+                : styles.btn
+          }
+          disabled={surveyCaptureActive}
+          title={
+            surveyCaptureActive
+              ? "Finish or cancel the room sample before switching views"
+              : undefined
+          }
         >
           Mesh
+        </button>
+        <button
+          onClick={() => setView("survey")}
+          style={view === "survey" ? styles.btnActive : styles.btn}
+        >
+          Survey
         </button>
       </div>
 
       {view === "terrain" ? (
         <SignalHUD data={data} connected={terrainConnected} />
-      ) : (
+      ) : view === "mesh" ? (
         <MeshHUD
           meshData={meshData}
           connected={meshConnected}
           roamEvents={roamEvents}
         />
+      ) : (
+        <SurveyView
+          meshData={meshData}
+          connected={meshConnected}
+          onCaptureChange={setSurveyCaptureActive}
+        />
       )}
 
-      <CanvasErrorBoundary>
-        <Canvas
-          camera={{
-            position: view === "terrain" ? [0, 5, 8] : [8, 6, 8],
-            fov: 55,
-          }}
-          gl={{ antialias: true }}
-          dpr={[1, 2]}
-        >
-          <CameraController view={view} />
-          <ambientLight intensity={0.3} />
-          <directionalLight position={[5, 10, 5]} intensity={0.8} />
+      {view !== "survey" && (
+        <CanvasErrorBoundary>
+          <Canvas
+            camera={{
+              position: view === "terrain" ? [0, 5, 8] : [8, 6, 8],
+              fov: 55,
+            }}
+            gl={{ antialias: true }}
+            dpr={[1, 2]}
+          >
+            <CameraController view={view} />
+            <ambientLight intensity={0.3} />
+            <directionalLight position={[5, 10, 5]} intensity={0.8} />
 
-          {view === "terrain" ? (
-            <>
-              <WifiTerrain rssi={data?.linkUp ? data.rssi : null} />
-              <gridHelper args={[10, 20, "#1a1f30", "#1a1f30"]} />
-            </>
-          ) : (
-            <MeshScene meshData={meshData} roamEvents={roamEvents} />
-          )}
+            {view === "terrain" ? (
+              <>
+                <WifiTerrain rssi={data?.linkUp ? data.rssi : null} />
+                <gridHelper args={[10, 20, "#1a1f30", "#1a1f30"]} />
+              </>
+            ) : (
+              <MeshScene meshData={meshData} roamEvents={roamEvents} />
+            )}
 
-          <OrbitControls
-            enableDamping
-            dampingFactor={0.12}
-            minDistance={3}
-            maxDistance={25}
-            maxPolarAngle={Math.PI / 2.1}
-          />
-        </Canvas>
-      </CanvasErrorBoundary>
+            <OrbitControls
+              enableDamping
+              dampingFactor={0.12}
+              minDistance={3}
+              maxDistance={25}
+              maxPolarAngle={Math.PI / 2.1}
+            />
+          </Canvas>
+        </CanvasErrorBoundary>
+      )}
     </div>
   );
 }
@@ -206,6 +274,10 @@ const styles = {
     fontSize: 12,
     fontWeight: 600,
     letterSpacing: 0.5,
+  },
+  btnDisabled: {
+    cursor: "not-allowed",
+    opacity: 0.35,
   },
 };
 
