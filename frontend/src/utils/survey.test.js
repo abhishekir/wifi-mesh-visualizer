@@ -230,10 +230,9 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.validRssiSampleCount).toBe(100);
-    expect(result.signalSampleCount).toBe(100);
-    expect(result.signalSource).toBe("mixed");
     expect(result.medianRssi).toBe(-80);
     expect(result.confidence.level).toBe("low");
+    expect(result.confidence.reasons.join(" ")).toContain("Location Services");
     expect(result.classification.level).toBe("dead-zone");
   });
 
@@ -252,8 +251,6 @@ describe("aggregateSurvey", () => {
       endedAt: 11_000,
     });
 
-    expect(result.signalSource).toBe("mixed");
-    expect(result.signalSampleCount).toBe(100);
     expect(result.medianRssi).toBe(-60);
     expect(result.confidence.level).toBe("high");
     expect(result.classification.level).toBe("healthy");
@@ -272,8 +269,6 @@ describe("aggregateSurvey", () => {
       endedAt: 11_000,
     });
 
-    expect(result.signalSource).toBe("mixed");
-    expect(result.signalSampleCount).toBe(100);
     expect(result.medianRssi).toBe(-72);
     expect(result.medianSnr).toBe(22);
     expect(result.confidence.level).toBe("medium");
@@ -376,7 +371,6 @@ describe("aggregateSurvey", () => {
 
     expect(result.collectorFaultSampleCount).toBe(10);
     expect(result.linkSampleCount).toBe(90);
-    expect(result.offlineSampleCount).toBe(0);
     expect(result.linkDownPercent).toBe(0);
     expect(result.confidence.level).toBe("medium");
     expect(result.classification.level).toBe("healthy");
@@ -426,7 +420,6 @@ describe("aggregateSurvey", () => {
       endedAt: 11_000,
     });
 
-    expect(result.expectedSampleHz).toBe(2);
     expect(result.sampleCoveragePercent).toBe(100);
     expect(result.classification.level).toBe("healthy");
   });
@@ -440,12 +433,22 @@ describe("aggregateSurvey", () => {
       endedAt: 11_000,
     });
 
-    expect(result.expectedSampleHz).toBe(10);
     expect(result.sampleCoveragePercent).toBe(50);
     expect(result.classification).toMatchObject({
       level: "no-data",
       label: "Not enough data",
     });
+  });
+
+  it("explains how to restore confidence with an older server", () => {
+    const result = aggregateSurvey(fullWindow({ expectedSampleHz: null }), {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.sampleCoveragePercent).toBeNull();
+    expect(result.confidence.level).toBe("low");
+    expect(result.confidence.reasons.join(" ")).toContain("update the server");
   });
 
   it("treats an over-age scan cache as a data-quality warning", () => {
@@ -488,7 +491,6 @@ describe("aggregateSurvey", () => {
 
     expect(result.scanSampleCount).toBe(1);
     expect(result.scanStalePercent).toBe(1);
-    expect(result.signalSource).toBe("mixed");
     expect(result.confidence.level).toBe("high");
   });
 
@@ -506,7 +508,6 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.associationChanges).toBe(1);
-    expect(result.bssids).toEqual(["ap-1", "ap-2", "ap-3"]);
     expect(result.channels).toEqual([36, 149]);
   });
 
@@ -551,7 +552,6 @@ describe("classifySurvey", () => {
     linkSampleCount: 100,
     collectorFaultSampleCount: 0,
     validRssiSampleCount: 50,
-    signalSampleCount: 50,
     linkDownPercent: 0,
     lowRssi: -60,
     medianRssi: -55,
@@ -577,7 +577,6 @@ describe("classifySurvey", () => {
         sampleCount: 0,
         linkSampleCount: 0,
         validRssiSampleCount: 0,
-        signalSampleCount: 0,
       },
       "No collector frames",
     ],
@@ -587,7 +586,6 @@ describe("classifySurvey", () => {
         linkSampleCount: 0,
         collectorFaultSampleCount: 100,
         validRssiSampleCount: 0,
-        signalSampleCount: 0,
       },
       "Collector errors",
     ],
@@ -598,12 +596,12 @@ describe("classifySurvey", () => {
     ],
     [
       "frames without signal",
-      { validRssiSampleCount: 0, signalSampleCount: 0 },
+      { validRssiSampleCount: 0 },
       "none contained a usable RSSI",
     ],
     [
       "too few signal readings",
-      { validRssiSampleCount: 5, signalSampleCount: 5 },
+      { validRssiSampleCount: 5 },
       "Fewer than 10",
     ],
   ])("uses one no-data result for %s", (_, overrides, reason) => {
@@ -925,6 +923,7 @@ describe("survey persistence", () => {
           classification: { label: "Healthy", reasons: ["Stable signal"] },
           confidence: { label: "High confidence" },
           channels: [36, 149],
+          validRssiSampleCount: 100,
           expectedSampleHz: 10,
           collectorErrors: ["CoreWLAN private diagnostic"],
         },
@@ -934,6 +933,7 @@ describe("survey persistence", () => {
     expect(csv).toContain('"Home, ""August"""');
     expect(csv).toContain('"36; 149"');
     expect(csv).toContain('"Stable signal"');
+    expect(csv).toContain('"validRssiSampleCount"');
     expect(csv).not.toContain("expectedSampleHz");
     expect(csv).not.toContain("CoreWLAN private diagnostic");
   });

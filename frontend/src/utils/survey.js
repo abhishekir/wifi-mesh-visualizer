@@ -189,15 +189,9 @@ export function assessSurveyConfidence(metrics) {
   }
 
   if (metrics.ifaceCoveragePercent < 20) {
-    if (metrics.signalSource === "scan") {
-      reasons.push(
-        "RSSI came primarily from the slower scan cache; grant macOS Location Services for live readings."
-      );
-    } else {
-      reasons.push(
-        "Live interface RSSI covered less than 20% of usable readings."
-      );
-    }
+    reasons.push(
+      "RSSI came primarily from the slower scan cache; grant macOS Location Services for live readings."
+    );
   } else if (metrics.ifaceCoveragePercent < 80) {
     reasons.push(
       `Live interface RSSI covered ${metrics.ifaceCoveragePercent}% of usable readings.`
@@ -208,13 +202,15 @@ export function assessSurveyConfidence(metrics) {
     reasons.push("The capture window was shorter than recommended.");
   }
   if (!finite(metrics.sampleCoveragePercent)) {
-    reasons.push("The collector did not report its expected frame rate.");
+    reasons.push(
+      "The collector did not report its expected frame rate; update the server to restore full confidence scoring."
+    );
   } else if (metrics.sampleCoveragePercent < 80) {
     reasons.push(
       `Only ${metrics.sampleCoveragePercent}% of expected stream frames arrived.`
     );
   }
-  if (metrics.signalSampleCount < 10) {
+  if (metrics.validRssiSampleCount < 10) {
     reasons.push("Fewer than 10 RSSI readings contributed to the result.");
   }
   if (metrics.collectorFaultPercent > 0) {
@@ -228,7 +224,7 @@ export function assessSurveyConfidence(metrics) {
 
   if (
     metrics.ifaceCoveragePercent < 20 ||
-    metrics.signalSampleCount < 10 ||
+    metrics.validRssiSampleCount < 10 ||
     !finite(metrics.sampleCoveragePercent) ||
     metrics.sampleCoveragePercent <= 50 ||
     metrics.collectorFaultPercent >= 50 ||
@@ -294,7 +290,7 @@ export function classifySurvey(metrics) {
       );
     } else if (
       metrics.validRssiSampleCount > 0 &&
-      metrics.signalSampleCount < 10
+      metrics.validRssiSampleCount < 10
     ) {
       noDataReasons.push(
         "Fewer than 10 representative RSSI readings were captured."
@@ -357,22 +353,7 @@ export function aggregateSurvey(samples, options = {}) {
     (sample) => sample.rssiSource === "iface"
   );
   const scanSamples = withRssi.filter((sample) => sample.rssiSource === "scan");
-  let signalSource = "none";
-  if (withRssi.length > 0 && ifaceSamples.length === withRssi.length) {
-    signalSource = "iface";
-  } else if (withRssi.length > 0 && scanSamples.length === withRssi.length) {
-    signalSource = "scan";
-  } else if (
-    withRssi.length > 0 &&
-    ifaceSamples.length === 0 &&
-    scanSamples.length === 0
-  ) {
-    signalSource = "unknown";
-  } else if (withRssi.length > 0) {
-    signalSource = "mixed";
-  }
-  const signalSamples = withRssi;
-  const rssiValues = signalSamples.map((sample) => sample.rssi);
+  const rssiValues = withRssi.map((sample) => sample.rssi);
   const startedAt = finite(options.startedAt)
     ? options.startedAt
     : ordered[0]?.timestamp ?? Date.now();
@@ -402,7 +383,6 @@ export function aggregateSurvey(samples, options = {}) {
     startedAt,
     endedAt,
     elapsedSeconds: rounded(elapsedSeconds),
-    expectedSampleHz: rounded(reportedSampleHz),
     sampleCount: total,
     sampleCoveragePercent: rounded(
       expectedSamples
@@ -410,15 +390,11 @@ export function aggregateSurvey(samples, options = {}) {
         : null
     ),
     linkSampleCount: linkSamples.length,
-    connectedSampleCount: connected.length,
-    offlineSampleCount: offline.length,
     collectorFaultSampleCount: collectorFaults.length,
     collectorFaultPercent: rounded(
       total ? (collectorFaults.length / total) * 100 : 0
     ),
     validRssiSampleCount: withRssi.length,
-    signalSampleCount: signalSamples.length,
-    signalSource,
     ifaceSampleCount: ifaceSamples.length,
     ifaceCoveragePercent: rounded(
       withRssi.length ? (ifaceSamples.length / withRssi.length) * 100 : 0
@@ -435,14 +411,13 @@ export function aggregateSurvey(samples, options = {}) {
     medianRssi: rounded(percentile(rssiValues, 0.5)),
     lowRssi: rounded(percentile(rssiValues, 0.1)),
     minRssi: rounded(rssiValues.length ? Math.min(...rssiValues) : null),
-    medianSnr: rounded(percentile(signalSamples.map((sample) => sample.snr), 0.5)),
+    medianSnr: rounded(percentile(withRssi.map((sample) => sample.snr), 0.5)),
     medianTxRate: rounded(
-      percentile(signalSamples.map((sample) => sample.txRate), 0.5)
+      percentile(withRssi.map((sample) => sample.txRate), 0.5)
     ),
     rssiStdDev: rounded(standardDeviation(rssiValues)),
     ssid: mostCommon(connected.map((sample) => sample.ssid)),
     primaryBssid: mostCommon(connected.map((sample) => sample.bssid)),
-    bssids: unique(connected.map((sample) => sample.bssid)).sort(),
     channels: unique(connected.map((sample) => sample.channel)).sort(
       (a, b) => a - b
     ),
@@ -792,7 +767,7 @@ export function sessionToCsv(session) {
     "associationChanges",
     "sampleCount",
     "sampleCoveragePercent",
-    "signalSampleCount",
+    "validRssiSampleCount",
     "ifaceSampleCount",
     "scanSampleCount",
     "scanStalePercent",
@@ -820,7 +795,7 @@ export function sessionToCsv(session) {
     measurement.associationChanges,
     measurement.sampleCount,
     measurement.sampleCoveragePercent,
-    measurement.signalSampleCount,
+    measurement.validRssiSampleCount,
     measurement.ifaceSampleCount,
     measurement.scanSampleCount,
     measurement.scanStalePercent,
