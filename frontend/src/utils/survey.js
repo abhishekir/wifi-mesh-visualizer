@@ -1,9 +1,5 @@
 export const SURVEY_DURATION_SECONDS = 10;
 export const SURVEY_STORAGE_VERSION = 3;
-const DEFAULT_EXPECTED_SAMPLE_HZ = 10;
-const MIN_EXPECTED_SAMPLE_HZ = 1;
-const MAX_EXPECTED_SAMPLE_HZ = 20;
-const REPRESENTATIVE_SOURCE_SHARE = 0.8;
 const SCAN_AGE_WARNING_SECONDS = 8;
 const MAX_TOMBSTONES = 1000;
 
@@ -76,63 +72,14 @@ function unique(values) {
   return [...new Set(values.filter((value) => value != null && value !== ""))];
 }
 
-function normalizedTombstoneTimes(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const result = {};
-  for (const [id, deletedAt] of Object.entries(raw)) {
-    if (finite(deletedAt) && deletedAt >= 0) {
-      result[String(id)] = deletedAt;
-    }
-  }
-  return result;
-}
-
-function compactTombstones(ids, rawTimes) {
-  const times = normalizedTombstoneTimes(rawTimes);
-  const selectedIds = unique([
-    ...ids.map(String),
-    ...Object.keys(times),
-  ])
-    .sort(
-      (left, right) =>
-        (times[right] ?? 0) - (times[left] ?? 0) ||
-        left.localeCompare(right)
-    )
-    .slice(0, MAX_TOMBSTONES)
-    .sort();
-  const selectedTimes = {};
-  for (const id of selectedIds) {
-    if (finite(times[id])) selectedTimes[id] = times[id];
-  }
-  return { ids: selectedIds, times: selectedTimes };
-}
-
-function mergeTombstoneTimes(...sources) {
-  const merged = {};
-  for (const source of sources) {
-    for (const [id, deletedAt] of Object.entries(
-      normalizedTombstoneTimes(source)
-    )) {
-      merged[id] = Math.max(merged[id] ?? 0, deletedAt);
-    }
-  }
-  return merged;
-}
-
-function expectedSampleHz(samples) {
-  const intervals = [];
-  for (let index = 1; index < samples.length; index += 1) {
-    const interval = samples[index].timestamp - samples[index - 1].timestamp;
-    if (interval > 0) intervals.push(interval);
-  }
-  const medianInterval = percentile(intervals, 0.5);
-  if (!finite(medianInterval) || medianInterval <= 0) {
-    return DEFAULT_EXPECTED_SAMPLE_HZ;
-  }
-  return Math.min(
-    MAX_EXPECTED_SAMPLE_HZ,
-    Math.max(MIN_EXPECTED_SAMPLE_HZ, 1000 / medianInterval)
-  );
+function capTombstones(ids) {
+  return [
+    ...new Set(
+      ids
+        .filter((value) => value != null && value !== "")
+        .map(String)
+    ),
+  ].slice(-MAX_TOMBSTONES);
 }
 
 export function isWithinSurveyWindow(timestamp, startedAt, endedAt) {
@@ -217,6 +164,8 @@ export function sampleFromMeshFrame(meshData) {
       Object.hasOwn(connection, "error") && connection.error != null
         ? String(connection.error)
         : null,
+    expectedSampleHz:
+      finite(meshData.meshHz) && meshData.meshHz > 0 ? meshData.meshHz : null,
     scanAge: finite(meshData.scanAge) ? meshData.scanAge : null,
     scanStale: Boolean(meshData.scanStale),
   };
@@ -239,22 +188,28 @@ export function assessSurveyConfidence(metrics) {
     };
   }
 
-  if (metrics.signalSource === "scan") {
+  if (metrics.ifaceCoveragePercent < 20) {
+    if (metrics.signalSource === "scan") {
+      reasons.push(
+        "RSSI came primarily from the slower scan cache; grant macOS Location Services for live readings."
+      );
+    } else {
+      reasons.push(
+        "Live interface RSSI covered less than 20% of usable readings."
+      );
+    }
+  } else if (metrics.ifaceCoveragePercent < 80) {
     reasons.push(
-      "RSSI came from the slower scan cache; grant macOS Location Services for live readings."
+      `Live interface RSSI covered ${metrics.ifaceCoveragePercent}% of usable readings.`
     );
-  } else if (metrics.signalSource === "mixed") {
-    reasons.push(
-      "Neither live nor scan-backed RSSI covered enough of the window for a representative signal result."
-    );
-  } else if (metrics.signalSource === "unknown") {
-    reasons.push("RSSI readings did not identify their measurement source.");
   }
 
   if (metrics.elapsedSeconds < SURVEY_DURATION_SECONDS * 0.8) {
     reasons.push("The capture window was shorter than recommended.");
   }
-  if (metrics.sampleCoveragePercent < 80) {
+  if (!finite(metrics.sampleCoveragePercent)) {
+    reasons.push("The collector did not report its expected frame rate.");
+  } else if (metrics.sampleCoveragePercent < 80) {
     reasons.push(
       `Only ${metrics.sampleCoveragePercent}% of expected stream frames arrived.`
     );
@@ -267,16 +222,17 @@ export function assessSurveyConfidence(metrics) {
       `Collector telemetry failed for ${metrics.collectorFaultPercent}% of received frames.`
     );
   }
-  if (metrics.signalSource === "scan" && metrics.scanStalePercent > 0) {
+  if (metrics.scanSampleCount >= 10 && metrics.scanStalePercent > 0) {
     reasons.push("Scan-backed RSSI was stale during part of the capture.");
   }
 
   if (
-    metrics.signalSource !== "iface" ||
+    metrics.ifaceCoveragePercent < 20 ||
     metrics.signalSampleCount < 10 ||
+    !finite(metrics.sampleCoveragePercent) ||
     metrics.sampleCoveragePercent <= 50 ||
     metrics.collectorFaultPercent >= 50 ||
-    (metrics.signalSource === "scan" && metrics.scanStalePercent >= 50)
+    (metrics.scanSampleCount >= 10 && metrics.scanStalePercent >= 50)
   ) {
     return { level: "low", label: "Low confidence", reasons };
   }
@@ -294,15 +250,6 @@ export function assessSurveyConfidence(metrics) {
 
 export function classifySurvey(metrics) {
   const t = SURVEY_THRESHOLDS;
-
-  if (metrics.sampleCount === 0) {
-    return {
-      level: "no-data",
-      label: "No stream data",
-      reasons: ["No collector frames arrived during this capture."],
-    };
-  }
-
   const deadReasons = [];
   if (metrics.linkDownPercent >= t.deadLinkDownPercent) {
     deadReasons.push(
@@ -321,53 +268,44 @@ export function classifySurvey(metrics) {
     return { level: "dead-zone", label: "Dead-zone risk", reasons: deadReasons };
   }
 
-  if (
+  const noDataReasons = [];
+  const collectorUnavailable =
     metrics.linkSampleCount === 0 &&
-    metrics.collectorFaultSampleCount > 0
-  ) {
-    return {
-      level: "no-data",
-      label: "Collector unavailable",
-      reasons: ["Collector errors prevented any Wi-Fi link observations."],
-    };
-  }
-
-  if (
-    finite(metrics.sampleCoveragePercent) &&
-    metrics.sampleCoveragePercent <= 50
-  ) {
-    return {
-      level: "no-data",
-      label: "Incomplete capture",
-      reasons: [
+    metrics.collectorFaultSampleCount > 0;
+  if (metrics.sampleCount === 0) {
+    noDataReasons.push("No collector frames arrived during this capture.");
+  } else {
+    if (collectorUnavailable) {
+      noDataReasons.push(
+        "Collector errors prevented any Wi-Fi link observations."
+      );
+    }
+    if (
+      finite(metrics.sampleCoveragePercent) &&
+      metrics.sampleCoveragePercent <= 50
+    ) {
+      noDataReasons.push(
         `Collector frames covered only ${metrics.sampleCoveragePercent}% of the capture window.`,
-      ],
-    };
+      );
+    }
+    if (metrics.validRssiSampleCount === 0 && !collectorUnavailable) {
+      noDataReasons.push(
+        "Frames arrived, but none contained a usable RSSI reading."
+      );
+    } else if (
+      metrics.validRssiSampleCount > 0 &&
+      metrics.signalSampleCount < 10
+    ) {
+      noDataReasons.push(
+        "Fewer than 10 representative RSSI readings were captured."
+      );
+    }
   }
-
-  if (metrics.signalSource === "mixed") {
+  if (noDataReasons.length > 0) {
     return {
       level: "no-data",
-      label: "Mixed signal sources",
-      reasons: [
-        "Neither live nor scan-backed RSSI represented at least 80% of usable readings.",
-      ],
-    };
-  }
-
-  if (metrics.validRssiSampleCount === 0) {
-    return {
-      level: "no-data",
-      label: "No signal data",
-      reasons: ["Frames arrived, but none contained a usable RSSI reading."],
-    };
-  }
-
-  if (metrics.signalSampleCount < 10) {
-    return {
-      level: "no-data",
-      label: "Insufficient signal data",
-      reasons: ["Fewer than 10 representative RSSI readings were captured."],
+      label: "Not enough data",
+      reasons: noDataReasons,
     };
   }
 
@@ -419,30 +357,21 @@ export function aggregateSurvey(samples, options = {}) {
     (sample) => sample.rssiSource === "iface"
   );
   const scanSamples = withRssi.filter((sample) => sample.rssiSource === "scan");
-  const ifaceShare = withRssi.length
-    ? ifaceSamples.length / withRssi.length
-    : 0;
-  const scanShare = withRssi.length
-    ? scanSamples.length / withRssi.length
-    : 0;
   let signalSource = "none";
-  let signalSamples = [];
-  if (ifaceShare >= REPRESENTATIVE_SOURCE_SHARE) {
+  if (withRssi.length > 0 && ifaceSamples.length === withRssi.length) {
     signalSource = "iface";
-    signalSamples = ifaceSamples;
-  } else if (scanShare >= REPRESENTATIVE_SOURCE_SHARE) {
+  } else if (withRssi.length > 0 && scanSamples.length === withRssi.length) {
     signalSource = "scan";
-    signalSamples = scanSamples;
   } else if (
     withRssi.length > 0 &&
     ifaceSamples.length === 0 &&
     scanSamples.length === 0
   ) {
     signalSource = "unknown";
-    signalSamples = withRssi;
   } else if (withRssi.length > 0) {
     signalSource = "mixed";
   }
+  const signalSamples = withRssi;
   const rssiValues = signalSamples.map((sample) => sample.rssi);
   const startedAt = finite(options.startedAt)
     ? options.startedAt
@@ -458,18 +387,27 @@ export function aggregateSurvey(samples, options = {}) {
       (finite(sample.scanAge) && sample.scanAge > SCAN_AGE_WARNING_SECONDS)
   ).length;
   const elapsedSeconds = Math.max(0, endedAt - startedAt) / 1000;
-  const inferredSampleHz = expectedSampleHz(ordered);
-  const expectedSamples = elapsedSeconds * inferredSampleHz;
+  const reportedSampleHz = percentile(
+    ordered
+      .map((sample) => sample.expectedSampleHz)
+      .filter((value) => finite(value) && value > 0),
+    0.5
+  );
+  const expectedSamples = finite(reportedSampleHz)
+    ? elapsedSeconds * reportedSampleHz
+    : null;
 
   const metrics = {
     room: String(options.room ?? "").trim(),
     startedAt,
     endedAt,
     elapsedSeconds: rounded(elapsedSeconds),
-    expectedSampleHz: rounded(inferredSampleHz),
+    expectedSampleHz: rounded(reportedSampleHz),
     sampleCount: total,
     sampleCoveragePercent: rounded(
-      expectedSamples ? Math.min(100, (total / expectedSamples) * 100) : 0
+      expectedSamples
+        ? Math.min(100, (total / expectedSamples) * 100)
+        : null
     ),
     linkSampleCount: linkSamples.length,
     connectedSampleCount: connected.length,
@@ -507,9 +445,6 @@ export function aggregateSurvey(samples, options = {}) {
     bssids: unique(connected.map((sample) => sample.bssid)).sort(),
     channels: unique(connected.map((sample) => sample.channel)).sort(
       (a, b) => a - b
-    ),
-    collectorErrors: unique(
-      collectorFaults.map((sample) => sample.collectorError)
     ),
     associationChanges: associationChanges(ordered),
   };
@@ -591,26 +526,19 @@ export function migrateSurveyState(raw) {
     source.baselineSessionId !== activeSessionId
       ? source.baselineSessionId
       : null;
-  const compactedDeletedSessions = compactTombstones(
-    Array.isArray(source.deletedSessionIds) ? source.deletedSessionIds : [],
-    source.deletedSessionTimestamps
-  );
-  const compactedDeletedMeasurements = compactTombstones(
-    Array.isArray(source.deletedMeasurementIds)
-      ? source.deletedMeasurementIds
-      : [],
-    source.deletedMeasurementTimestamps
-  );
-
   return {
     version: SURVEY_STORAGE_VERSION,
     sessions,
     activeSessionId,
     baselineSessionId,
-    deletedSessionIds: compactedDeletedSessions.ids,
-    deletedSessionTimestamps: compactedDeletedSessions.times,
-    deletedMeasurementIds: compactedDeletedMeasurements.ids,
-    deletedMeasurementTimestamps: compactedDeletedMeasurements.times,
+    deletedSessionIds: capTombstones(
+      Array.isArray(source.deletedSessionIds) ? source.deletedSessionIds : []
+    ),
+    deletedMeasurementIds: capTombstones(
+      Array.isArray(source.deletedMeasurementIds)
+        ? source.deletedMeasurementIds
+        : []
+    ),
   };
 }
 
@@ -673,25 +601,14 @@ export function mergeSurveyStates(currentRaw, incomingRaw) {
     incomingRaw && typeof incomingRaw === "object" ? incomingRaw : {};
   const current = migrateSurveyState(currentRaw);
   const incoming = migrateSurveyState(incomingRaw);
-  const mergedDeletedSessions = compactTombstones(
-    [...current.deletedSessionIds, ...incoming.deletedSessionIds],
-    mergeTombstoneTimes(
-      current.deletedSessionTimestamps,
-      incoming.deletedSessionTimestamps
-    )
-  );
-  const mergedDeletedMeasurements = compactTombstones(
-    [
-      ...current.deletedMeasurementIds,
-      ...incoming.deletedMeasurementIds,
-    ],
-    mergeTombstoneTimes(
-      current.deletedMeasurementTimestamps,
-      incoming.deletedMeasurementTimestamps
-    )
-  );
-  const deletedSessionIds = mergedDeletedSessions.ids;
-  const deletedMeasurementIds = mergedDeletedMeasurements.ids;
+  const deletedSessionIds = capTombstones([
+    ...current.deletedSessionIds,
+    ...incoming.deletedSessionIds,
+  ]);
+  const deletedMeasurementIds = capTombstones([
+    ...current.deletedMeasurementIds,
+    ...incoming.deletedMeasurementIds,
+  ]);
   const deletedSessions = new Set(deletedSessionIds);
   const deletedMeasurements = new Set(deletedMeasurementIds);
   const sessionsById = new Map();
@@ -786,9 +703,7 @@ export function mergeSurveyStates(currentRaw, incomingRaw) {
     activeSessionId,
     baselineSessionId,
     deletedSessionIds,
-    deletedSessionTimestamps: mergedDeletedSessions.times,
     deletedMeasurementIds,
-    deletedMeasurementTimestamps: mergedDeletedMeasurements.times,
   };
 }
 
@@ -877,19 +792,12 @@ export function sessionToCsv(session) {
     "associationChanges",
     "sampleCount",
     "sampleCoveragePercent",
-    "expectedSampleHz",
-    "linkSampleCount",
-    "collectorFaultSampleCount",
-    "collectorFaultPercent",
     "signalSampleCount",
-    "signalSource",
     "ifaceSampleCount",
-    "ifaceCoveragePercent",
     "scanSampleCount",
     "scanStalePercent",
     "medianScanAge",
     "maxScanAge",
-    "collectorErrors",
     "reasons",
     "confidenceReasons",
   ];
@@ -912,19 +820,12 @@ export function sessionToCsv(session) {
     measurement.associationChanges,
     measurement.sampleCount,
     measurement.sampleCoveragePercent,
-    measurement.expectedSampleHz,
-    measurement.linkSampleCount,
-    measurement.collectorFaultSampleCount,
-    measurement.collectorFaultPercent,
     measurement.signalSampleCount,
-    measurement.signalSource,
     measurement.ifaceSampleCount,
-    measurement.ifaceCoveragePercent,
     measurement.scanSampleCount,
     measurement.scanStalePercent,
     measurement.medianScanAge,
     measurement.maxScanAge,
-    measurement.collectorErrors,
     measurement.classification?.reasons,
     measurement.confidence?.reasons,
   ]);

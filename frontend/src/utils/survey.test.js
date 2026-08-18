@@ -27,6 +27,7 @@ function reading(overrides = {}) {
     channel: 36,
     rssiSource: "iface",
     collectorError: null,
+    expectedSampleHz: 10,
     scanAge: 1,
     scanStale: false,
     ...overrides,
@@ -77,6 +78,7 @@ describe("sampleFromMeshFrame", () => {
   it("normalizes a mesh frame and lowercases the BSSID", () => {
     const sample = sampleFromMeshFrame({
       timestamp: 12.5,
+      meshHz: 10,
       scanAge: 2,
       scanStale: false,
       connection: {
@@ -96,6 +98,7 @@ describe("sampleFromMeshFrame", () => {
       bssid: "aa:bb:cc:dd:ee:ff",
       rssi: -62,
       channel: 149,
+      expectedSampleHz: 10,
     });
   });
 
@@ -227,40 +230,19 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.validRssiSampleCount).toBe(100);
-    expect(result.signalSampleCount).toBe(99);
-    expect(result.signalSource).toBe("scan");
+    expect(result.signalSampleCount).toBe(100);
+    expect(result.signalSource).toBe("mixed");
     expect(result.medianRssi).toBe(-80);
     expect(result.confidence.level).toBe("low");
     expect(result.classification.level).toBe("dead-zone");
   });
 
-  it("keeps interface and scan-backed RSSI in representative cohorts", () => {
+  it("uses all interface and scan-backed RSSI at the confidence boundary", () => {
     const samples = fullWindow({ rssi: -60 });
     for (let index = 0; index < 20; index += 1) {
       samples[index] = {
         ...samples[index],
-        rssi: -80,
-        rssiSource: "scan",
-        snr: null,
-      };
-    }
-    const result = aggregateSurvey(samples, {
-      startedAt: 1_000,
-      endedAt: 11_000,
-    });
-
-    expect(result.signalSource).toBe("iface");
-    expect(result.signalSampleCount).toBe(80);
-    expect(result.medianRssi).toBe(-60);
-    expect(result.classification.level).toBe("healthy");
-  });
-
-  it("marks a capture indeterminate when neither RSSI source dominates", () => {
-    const samples = fullWindow({ rssi: -60 });
-    for (let index = 0; index < 40; index += 1) {
-      samples[index] = {
-        ...samples[index],
-        rssi: -80,
+        rssi: -60,
         rssiSource: "scan",
         snr: null,
       };
@@ -271,11 +253,31 @@ describe("aggregateSurvey", () => {
     });
 
     expect(result.signalSource).toBe("mixed");
-    expect(result.signalSampleCount).toBe(0);
-    expect(result.classification).toMatchObject({
-      level: "no-data",
-      label: "Mixed signal sources",
+    expect(result.signalSampleCount).toBe(100);
+    expect(result.medianRssi).toBe(-60);
+    expect(result.confidence.level).toBe("high");
+    expect(result.classification.level).toBe("healthy");
+  });
+
+  it("keeps mixed-source signal metrics and downgrades confidence", () => {
+    const samples = fullWindow({ rssi: -72, snr: 22 });
+    for (let index = 0; index < 30; index += 1) {
+      samples[index] = {
+        ...samples[index],
+        rssiSource: "scan",
+      };
+    }
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
     });
+
+    expect(result.signalSource).toBe("mixed");
+    expect(result.signalSampleCount).toBe(100);
+    expect(result.medianRssi).toBe(-72);
+    expect(result.medianSnr).toBe(22);
+    expect(result.confidence.level).toBe("medium");
+    expect(result.classification.level).toBe("weak");
   });
 
   it("classifies a non-positive SNR as dead-zone risk", () => {
@@ -395,7 +397,7 @@ describe("aggregateSurvey", () => {
     expect(result.linkDownPercent).toBeNull();
     expect(result.classification).toMatchObject({
       level: "no-data",
-      label: "Collector unavailable",
+      label: "Not enough data",
     });
   });
 
@@ -411,13 +413,13 @@ describe("aggregateSurvey", () => {
     expect(result.confidence.reasons.join(" ")).toContain("expected stream frames");
     expect(result.classification).toMatchObject({
       level: "no-data",
-      label: "Incomplete capture",
+      label: "Not enough data",
     });
   });
 
-  it("derives expected cadence from observed frame timing", () => {
+  it("uses the advertised cadence instead of inferring it from frames", () => {
     const samples = Array.from({ length: 20 }, (_, index) =>
-      reading({ timestamp: 1_000 + index * 500 })
+      reading({ timestamp: 1_000 + index * 500, expectedSampleHz: 2 })
     );
     const result = aggregateSurvey(samples, {
       startedAt: 1_000,
@@ -427,6 +429,23 @@ describe("aggregateSurvey", () => {
     expect(result.expectedSampleHz).toBe(2);
     expect(result.sampleCoveragePercent).toBe(100);
     expect(result.classification.level).toBe("healthy");
+  });
+
+  it("detects a uniformly half-speed collector", () => {
+    const samples = Array.from({ length: 50 }, (_, index) =>
+      reading({ timestamp: 1_000 + index * 200 })
+    );
+    const result = aggregateSurvey(samples, {
+      startedAt: 1_000,
+      endedAt: 11_000,
+    });
+
+    expect(result.expectedSampleHz).toBe(10);
+    expect(result.sampleCoveragePercent).toBe(50);
+    expect(result.classification).toMatchObject({
+      level: "no-data",
+      label: "Not enough data",
+    });
   });
 
   it("treats an over-age scan cache as a data-quality warning", () => {
@@ -469,7 +488,7 @@ describe("aggregateSurvey", () => {
 
     expect(result.scanSampleCount).toBe(1);
     expect(result.scanStalePercent).toBe(1);
-    expect(result.signalSource).toBe("iface");
+    expect(result.signalSource).toBe("mixed");
     expect(result.confidence.level).toBe("high");
   });
 
@@ -527,7 +546,12 @@ describe("aggregateSurvey", () => {
 
 describe("classifySurvey", () => {
   const base = {
+    sampleCount: 100,
+    sampleCoveragePercent: 100,
+    linkSampleCount: 100,
+    collectorFaultSampleCount: 0,
     validRssiSampleCount: 50,
+    signalSampleCount: 50,
     linkDownPercent: 0,
     lowRssi: -60,
     medianRssi: -55,
@@ -544,6 +568,52 @@ describe("classifySurvey", () => {
     const result = classifySurvey({ ...base, medianSnr: 8 });
     expect(result.level).toBe("dead-zone");
     expect(result.reasons[0]).toContain("SNR");
+  });
+
+  it.each([
+    [
+      "an empty stream",
+      {
+        sampleCount: 0,
+        linkSampleCount: 0,
+        validRssiSampleCount: 0,
+        signalSampleCount: 0,
+      },
+      "No collector frames",
+    ],
+    [
+      "collector failures",
+      {
+        linkSampleCount: 0,
+        collectorFaultSampleCount: 100,
+        validRssiSampleCount: 0,
+        signalSampleCount: 0,
+      },
+      "Collector errors",
+    ],
+    [
+      "low frame coverage",
+      { sampleCoveragePercent: 50 },
+      "covered only 50%",
+    ],
+    [
+      "frames without signal",
+      { validRssiSampleCount: 0, signalSampleCount: 0 },
+      "none contained a usable RSSI",
+    ],
+    [
+      "too few signal readings",
+      { validRssiSampleCount: 5, signalSampleCount: 5 },
+      "Fewer than 10",
+    ],
+  ])("uses one no-data result for %s", (_, overrides, reason) => {
+    const result = classifySurvey({ ...base, ...overrides });
+
+    expect(result).toMatchObject({
+      level: "no-data",
+      label: "Not enough data",
+    });
+    expect(result.reasons.join(" ")).toContain(reason);
   });
 });
 
@@ -781,10 +851,10 @@ describe("survey persistence", () => {
     const migrated = migrateSurveyState({
       sessions: [],
       deletedMeasurementIds,
-      deletedMeasurementTimestamps: { "a-new-deletion": 1_000 },
     });
 
     expect(migrated.deletedMeasurementIds).toContain("a-new-deletion");
+    expect(migrated.deletedMeasurementIds).not.toContain("z-old-0000");
     expect(migrated.deletedMeasurementIds).toHaveLength(1_000);
   });
 
@@ -855,6 +925,8 @@ describe("survey persistence", () => {
           classification: { label: "Healthy", reasons: ["Stable signal"] },
           confidence: { label: "High confidence" },
           channels: [36, 149],
+          expectedSampleHz: 10,
+          collectorErrors: ["CoreWLAN private diagnostic"],
         },
       ],
     });
@@ -862,6 +934,8 @@ describe("survey persistence", () => {
     expect(csv).toContain('"Home, ""August"""');
     expect(csv).toContain('"36; 149"');
     expect(csv).toContain('"Stable signal"');
+    expect(csv).not.toContain("expectedSampleHz");
+    expect(csv).not.toContain("CoreWLAN private diagnostic");
   });
 
   it("neutralizes spreadsheet formulas in user-controlled CSV fields", () => {

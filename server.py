@@ -342,6 +342,7 @@ def _build_mesh_payload() -> dict:
     return {
         "nodes": nodes,
         "connection": connection,
+        "meshHz": MESH_HZ,
         "scanAge": (time.time() - cached_at) if cached_at else None,
         "scanStale": cached_at == 0.0,
         "timestamp": time.time(),

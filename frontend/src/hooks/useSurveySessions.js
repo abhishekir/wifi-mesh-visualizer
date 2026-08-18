@@ -232,12 +232,6 @@ export default function useSurveySessions() {
         deletedMeasurementIds: alreadyDeleted
           ? current.deletedMeasurementIds
           : [...current.deletedMeasurementIds, measurementId],
-        deletedMeasurementTimestamps: alreadyDeleted
-          ? current.deletedMeasurementTimestamps
-          : {
-              ...current.deletedMeasurementTimestamps,
-              [measurementId]: Date.now(),
-            },
         sessions: current.sessions.map((session) =>
           session.id === sessionId
             ? {
@@ -270,12 +264,6 @@ export default function useSurveySessions() {
         deletedSessionIds: alreadyDeleted
           ? current.deletedSessionIds
           : [...current.deletedSessionIds, sessionId],
-        deletedSessionTimestamps: alreadyDeleted
-          ? current.deletedSessionTimestamps
-          : {
-              ...current.deletedSessionTimestamps,
-              [sessionId]: Date.now(),
-            },
         baselineSessionId:
           current.baselineSessionId === sessionId ||
           current.baselineSessionId === activeSessionId

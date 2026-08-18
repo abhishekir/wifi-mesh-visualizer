@@ -507,7 +507,10 @@ function GridFloor() {
 export default function MeshScene({ meshData, roamEvents = [] }) {
   const [processedNodes, setProcessedNodes] = useState([]);
   const [userTarget, setUserTarget] = useState([0, 0.5, 0]);
-  const [localizable, setLocalizable] = useState(false);
+  const [localization, setLocalization] = useState({
+    localizable: false,
+    frame: null,
+  });
   const smoothTarget = useRef([0, 0.5, 0]);
   const layoutRef = useRef(new Map());
 
@@ -521,7 +524,6 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
   // until the next refresh recalibrates.
   const biasRef = useRef(new Map());
   const lastScanTsRef = useRef(0);
-  const localizedMeshDataRef = useRef(null);
 
   // Lift positioned roam events to state so the scene actually re-renders
   // when a roam fires between mesh frames.
@@ -543,10 +545,11 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
     hasNodeData &&
     Boolean(connectedSSID) &&
     meshData.nodes.some((node) => node.ssid === connectedSSID);
+  const localizable = localization.localizable;
   const currentFrameLocalized =
     hasLocalizationTarget &&
     localizable &&
-    localizedMeshDataRef.current === meshData;
+    localization.frame === meshData;
 
   useEffect(() => {
     if (!roamEvents.length) return;
@@ -578,9 +581,8 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
 
   useEffect(() => {
     if (!meshData?.nodes || meshData.nodes.length === 0) {
-      localizedMeshDataRef.current = null;
       setProcessedNodes([]);
-      setLocalizable(false);
+      setLocalization({ localizable: false, frame: null });
       return;
     }
     const nodes = meshData.nodes;
@@ -715,12 +717,10 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
         0.5,
         pScan[2] + dz * factor,
       ];
-      localizedMeshDataRef.current = meshData;
-      setLocalizable(true);
+      setLocalization({ localizable: true, frame: meshData });
     } else {
       raw = smoothTarget.current;
-      localizedMeshDataRef.current = null;
-      setLocalizable(false);
+      setLocalization({ localizable: false, frame: null });
     }
 
     const prev = smoothTarget.current;
