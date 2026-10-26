@@ -219,7 +219,8 @@ function App() {
 
             {view === "terrain" ? (
               <>
-                <WifiTerrain rssi={data?.linkUp ? data.rssi : null} />
+                {/* 0 is the server's "RSSI unavailable" sentinel, not a reading. */}
+                <WifiTerrain rssi={data?.linkUp && data.rssi ? data.rssi : null} />
                 <gridHelper args={[10, 20, "#1a1f30", "#1a1f30"]} />
               </>
             ) : (

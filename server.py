@@ -28,7 +28,7 @@ import time
 from collections import defaultdict
 
 import websockets
-from CoreWLAN import CWWiFiClient
+from CoreWLAN import CWInterface, CWWiFiClient
 
 # ── Tunables ────────────────────────────────────────────────────────────
 HOST = "127.0.0.1"
@@ -51,6 +51,10 @@ log = logging.getLogger("wifi")
 _client = CWWiFiClient.sharedWiFiClient()
 _iface = _client.interface()
 _iface_lock = threading.Lock()   # CoreWLAN calls are not thread-safe
+# Scans get their own interface instance, used by one thread at a time. A
+# full scan can block for 10+ seconds; sharing _iface_lock would freeze every
+# live poll (and both streams) for its duration.
+_scan_iface = CWInterface.interfaceWithName_(_iface.interfaceName()) if _iface else None
 
 # ── Scan cache ──────────────────────────────────────────────────────────
 _cache_lock = threading.Lock()
@@ -70,6 +74,15 @@ def health_from_rssi(rssi: int) -> str:
     if rssi >= -70:
         return "Fair"
     return "Poor"
+
+
+_BAND_NAMES = {1: "2.4GHz", 2: "5GHz", 3: "6GHz"}  # CWChannelBand values
+
+
+def band_name(ch_obj) -> str:
+    """Band label from CoreWLAN. The channel number alone is ambiguous: the
+    6 GHz plan reuses numbers from both the 2.4 GHz and 5 GHz plans."""
+    return _BAND_NAMES.get(ch_obj.channelBand(), "?") if ch_obj else "?"
 
 
 def _rssi_from_cache(channel: int, ssid: str | None) -> int | None:
@@ -135,6 +148,7 @@ def poll_wifi() -> dict:
                 bssid = None
             ch_obj = _iface.wlanChannel()
             channel = ch_obj.channelNumber() if ch_obj else 0
+            band = band_name(ch_obj)
     except Exception as exc:
         log.warning("poll_wifi failed: %s", exc)
         return {"linkUp": False, "error": str(exc), "timestamp": time.time()}
@@ -163,6 +177,7 @@ def poll_wifi() -> dict:
         # PyObjC may return None on transient errors — guard the float cast.
         "txRate": round(float(tx_rate or 0), 1),
         "channel": int(channel),
+        "band": band,
         "timestamp": time.time(),
     }
 
@@ -175,8 +190,7 @@ def scan_networks() -> list[dict]:
     radios are broadcasting the same SSID.
     """
     try:
-        with _iface_lock:
-            networks, error = _iface.scanForNetworksWithName_error_(None, None)
+        networks, error = _scan_iface.scanForNetworksWithName_error_(None, None)
     except Exception as exc:
         log.warning("scan failed: %s", exc)
         return []
@@ -192,7 +206,7 @@ def scan_networks() -> list[dict]:
             rssi = int(net.rssiValue())
             ch_obj = net.wlanChannel()
             channel = ch_obj.channelNumber() if ch_obj else 0
-            band = "5GHz" if channel > 14 else "2.4GHz"
+            band = band_name(ch_obj)
             bssid = net.bssid()
             if not bssid:
                 # macOS hides BSSID for non-connected APs under some privacy
@@ -392,16 +406,22 @@ async def producer(bus: Broadcaster, build, hz: int):
     """Poll at fixed rate while at least one client is subscribed."""
     period = 1.0 / hz
     idle_period = 0.5  # check less often when no one is listening
+    loop = asyncio.get_running_loop()
+    next_tick = loop.time()
     while True:
         if bus.subscriber_count() == 0:
             await asyncio.sleep(idle_period)
+            next_tick = loop.time()
             continue
         try:
             payload = await asyncio.to_thread(build)
             bus.publish(payload)
         except Exception:
             log.exception("producer %s build failed", bus.name)
-        await asyncio.sleep(period)
+        # Schedule on a fixed cadence so build time doesn't stretch the
+        # period. After a stall, resume from now rather than bursting.
+        next_tick = max(next_tick + period, loop.time())
+        await asyncio.sleep(next_tick - loop.time())
 
 
 async def serve_stream(websocket, bus: Broadcaster):
