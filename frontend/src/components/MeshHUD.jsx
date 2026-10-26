@@ -24,11 +24,6 @@ function formatTime(ts) {
   });
 }
 
-function bandLabel(channel) {
-  if (!channel) return "?";
-  return channel > 14 ? "5GHz" : "2.4GHz";
-}
-
 export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
   if (!connected) {
     return (
@@ -109,7 +104,7 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
             <div style={styles.row}>
               <span style={styles.label}>Channel</span>
               <span style={styles.value}>
-                {connection.channel} <span style={styles.bandTag}>{bandLabel(connection.channel)}</span>
+                {connection.channel} <span style={styles.bandTag}>{connection.band ?? "?"}</span>
               </span>
             </div>
             <div style={styles.row}>

@@ -96,7 +96,9 @@ rm -f "$PORT_FILE"
 PORT_FILE=""
 
 echo "Starting frontend..."
-( cd "$DIR/frontend" && npx vite --open ) &
+# exec so FRONTEND_PID is npx itself (which forwards signals to vite), not a
+# wrapper subshell whose death would orphan vite and leave its port bound.
+( cd "$DIR/frontend" && exec npx vite --open ) &
 FRONTEND_PID=$!
 
 echo ""

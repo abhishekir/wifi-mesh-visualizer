@@ -742,7 +742,10 @@ export default function MeshScene({ meshData, roamEvents = [] }) {
       <GroundHeatmap
         userPos={userTarget}
         rssi={
-          currentFrameLocalized && linkUp ? connectedRssi : null
+          // 0 is the server's "RSSI unavailable" sentinel, not a reading.
+          currentFrameLocalized && linkUp && connectedRssi
+            ? connectedRssi
+            : null
         }
       />
       <RoamingMarkers events={positionedRoamEvents} />

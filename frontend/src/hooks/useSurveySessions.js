@@ -86,7 +86,9 @@ export default function useSurveySessions() {
 
   useEffect(() => {
     function handleStorage(event) {
-      if (event.key !== STORAGE_KEY) return;
+      // A null key means another tab cleared all of localStorage.
+      if (event.storageArea !== globalThis.localStorage) return;
+      if (event.key !== null && event.key !== STORAGE_KEY) return;
       if (event.newValue == null) {
         const empty = migrateSurveyState(null);
         setState(empty);
