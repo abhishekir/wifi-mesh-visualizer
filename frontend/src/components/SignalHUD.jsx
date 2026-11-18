@@ -1,3 +1,6 @@
+import PathDiagnostics from "./PathDiagnostics";
+import { LINK_RATE_HINT } from "../utils/diagnostics";
+
 const healthColor = {
   Excellent: "#00ff88",
   Good: "#88ff00",
@@ -72,9 +75,12 @@ export default function SignalHUD({ data, connected }) {
         <span style={styles.value}>{data.snr} dB</span>
       </div>
 
-      <div style={styles.row}>
-        <span style={styles.label}>Tx Rate</span>
-        <span style={styles.value}>{data.txRate} Mbps</span>
+      <div style={styles.row} title={LINK_RATE_HINT}>
+        <span style={styles.label}>Link rate</span>
+        <span style={styles.value}>
+          {data.txRate} Mbps
+          <span style={styles.tag}>not throughput</span>
+        </span>
       </div>
 
       <div style={styles.row}>
@@ -92,6 +98,13 @@ export default function SignalHUD({ data, connected }) {
         />
         <span style={{ ...styles.healthText, color }}>{data.health}</span>
       </div>
+
+      {data.path && (
+        <div style={styles.pathSection}>
+          <div style={styles.sectionTitle}>Path</div>
+          <PathDiagnostics path={data.path} styles={styles} />
+        </div>
+      )}
     </div>
   );
 }
@@ -132,6 +145,25 @@ const styles = {
   value: {
     fontWeight: 600,
     color: "#e0e0e0",
+  },
+  tag: {
+    fontSize: 10,
+    color: "#667",
+    marginLeft: 6,
+    fontWeight: 400,
+  },
+  pathSection: {
+    marginTop: 12,
+    paddingTop: 10,
+    borderTop: "1px solid rgba(255,255,255,0.1)",
+  },
+  sectionTitle: {
+    fontSize: 10,
+    fontWeight: 600,
+    color: "#556",
+    textTransform: "uppercase",
+    letterSpacing: 1.2,
+    marginBottom: 6,
   },
   healthBadge: {
     display: "flex",

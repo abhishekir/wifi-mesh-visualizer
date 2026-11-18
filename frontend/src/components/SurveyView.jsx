@@ -714,7 +714,7 @@ export default function SurveyView({ meshData, connected, onCaptureChange }) {
                       value={metric(latest.medianSnr, " dB")}
                     />
                     <ResultMetric
-                      label="Median Tx rate"
+                      label="Median link rate"
                       value={metric(latest.medianTxRate, " Mbps")}
                     />
                     <ResultMetric

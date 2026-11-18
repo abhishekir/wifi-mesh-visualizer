@@ -6,6 +6,7 @@ import SignalHUD from "./components/SignalHUD";
 import MeshScene from "./components/MeshScene";
 import MeshHUD from "./components/MeshHUD";
 import SurveyView from "./components/SurveyView";
+import DiagnoseView from "./components/DiagnoseView";
 import useWifiData from "./hooks/useWifiData";
 import useMeshData from "./hooks/useMeshData";
 import "./App.css";
@@ -185,6 +186,24 @@ function App() {
         >
           Survey
         </button>
+        <button
+          onClick={() => setView("diagnose")}
+          style={
+            view === "diagnose"
+              ? styles.btnActive
+              : surveyCaptureActive
+                ? { ...styles.btn, ...styles.btnDisabled }
+                : styles.btn
+          }
+          disabled={surveyCaptureActive}
+          title={
+            surveyCaptureActive
+              ? "Finish or cancel the room sample before switching views"
+              : undefined
+          }
+        >
+          Diagnose
+        </button>
       </div>
 
       {view === "terrain" ? (
@@ -195,15 +214,17 @@ function App() {
           connected={meshConnected}
           roamEvents={roamEvents}
         />
-      ) : (
+      ) : view === "survey" ? (
         <SurveyView
           meshData={meshData}
           connected={meshConnected}
           onCaptureChange={setSurveyCaptureActive}
         />
+      ) : (
+        <DiagnoseView />
       )}
 
-      {view !== "survey" && (
+      {(view === "terrain" || view === "mesh") && (
         <CanvasErrorBoundary>
           <Canvas
             camera={{

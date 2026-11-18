@@ -15,6 +15,18 @@ debugging roaming, signal hand-offs, and dead spots.
 - **Survey view** — record repeatable 10-second samples in named rooms, rank
   weak locations, compare against an earlier session, and export JSON or CSV
   evidence.
+- **Path panel** (Terrain and Mesh views) — latency, jitter, and packet loss
+  from this Mac to the Wi-Fi router, plus whether internet traffic is going
+  through a VPN. Use it to tell a weak Wi-Fi hop apart from a slow ISP or VPN.
+- **Diagnose view** — a ~30-second run that pings the router, the ISP's first
+  hop (via traceroute), and 1.1.1.1 while idle and while macOS's
+  `networkQuality` saturates download, then upload. Each hop is charged only
+  for the latency it adds beyond the previous hop, so the first hop whose
+  latency rises under load is where traffic queues. Results show a verdict per
+  hop (Wi-Fi link, router to ISP, internet, speed) with the measurements behind
+  it, plus suggestions (band, channel, channel width, QoS/SQM, plan limit,
+  VPN). It can't measure Wi-Fi throughput alone (that needs a wired iperf3
+  peer) or links between mesh units. With a VPN on, the ISP hop is skipped.
 
 ## Requirements
 
@@ -51,6 +63,17 @@ configures the UI automatically.
 - A background thread runs `scanForNetworksWithName_error_` every 3 s and
   caches the result. The cache is age-tracked and dropped after 15 s of
   failing scans so the UI can warn instead of showing stale data.
+- A second background thread pings the router 10 times every 5 s and keeps
+  the last 60 results for the Path panel. The ping is bound to the Wi-Fi
+  interface and the router is found from that interface's own default route,
+  so a full-tunnel VPN doesn't redirect it to the VPN endpoint. The same
+  thread reads which interface carries the IPv4 default route; a `utun`,
+  `ipsec`, `ppp`, `tun`, or `tap` interface is reported as a VPN.
+- Scans and latency measurements share a radio lock. A scan takes the radio
+  off channel (router pings measured jumping from ~4 ms to 189 ms, with
+  "No route to host" failures), so pings never overlap one, and a diagnosis
+  pauses scanning for its whole run. Scans from a second app instance can't
+  be paused, so run one instance while diagnosing.
 - Two `Broadcaster` instances (`terrain`, `mesh`) fan-out frames to all
   subscribers. Slow clients drop the oldest frame instead of blocking the
   producer; CoreWLAN is polled once per stream regardless of client count.
@@ -114,7 +137,7 @@ when checking real rooms.
 5. Export JSON for complete structured results or CSV for a spreadsheet.
    Exports may contain the local SSID and BSSIDs.
 
-Each result includes median and low-percentile RSSI, SNR, transmit rate,
+Each result includes median and low-percentile RSSI, SNR, link rate,
 signal variation, link-down percentage, serving radio, channel changes, and
 an explicit assessment. A result is marked low confidence when live readings
 are unavailable, scan-backed readings are stale, too few readings arrive, or
@@ -126,8 +149,11 @@ only in the browser's local storage.
 1. **Roam markers** — every channel change is logged with the position where
    it happened. A cluster of roams in one spot usually means weak handoff
    coverage.
-2. **Mesh topology panel** — shows distinct BSSID count and channels per SSID.
-   If your "mesh" only reports 1 radio, the satellite isn't broadcasting.
+2. **Mesh topology panel** — shows radios (distinct BSSIDs) per band and
+   channels per SSID. Each mesh unit usually has one radio per band, so the
+   per-band count is the best estimate of how many units are in range. When
+   macOS hides BSSIDs, radios on the same channel merge into one entry and the
+   panel says the unit count is unknown instead of guessing.
 3. **Scan age** — turns orange when the macOS scanner stops returning data;
    indicates Wi-Fi sleep, driver issues, or out-of-range conditions.
 4. **Connection beam** — drops when the link goes down even if the SSID
@@ -135,3 +161,9 @@ only in the browser's local storage.
 5. **Heatmap** — running-average per cell, walk around to map dead spots.
 6. **Room survey** — ranks named locations using repeatable signal and link
    stability measurements instead of inferred 3D coordinates.
+7. **Path panel** — if router latency and loss look good but speed tests are
+   slow, the bottleneck is past your Wi-Fi: the ISP plan, or the VPN when the
+   panel shows one. **Link rate** is the radio's negotiated rate, not
+   throughput; expect roughly half to two-thirds of it in practice. Some
+   routers ignore ping, so 100% loss with a strong signal usually means that
+   rather than a dead link.
