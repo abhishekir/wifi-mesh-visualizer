@@ -13,6 +13,10 @@ export const LINK_RATE_HINT =
   "Real throughput is usually about half to two-thirds of it, and lower " +
   "when other devices share the channel.";
 
+// Probes run every 5 s but can wait ~14 s behind a scan; past this the probe
+// has stopped and its numbers are out of date.
+export const PATH_STALE_S = 45;
+
 function tone(value, goodBelow, fairBelow) {
   if (!Number.isFinite(value)) return "unknown";
   if (value < goodBelow) return "good";

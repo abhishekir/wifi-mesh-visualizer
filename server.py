@@ -310,8 +310,9 @@ def scanner_loop():
 # Interface prefixes macOS VPN clients create (utun: WireGuard, GlobalProtect,
 # most app-based VPNs; ipsec: built-in IKEv2; ppp: L2TP).
 _TUNNEL_PREFIXES = ("utun", "ipsec", "ppp", "tun", "tap")
-_PING_RTT = re.compile(r"time=([\d.]+) ms")
+_PING_REPLY = re.compile(r"icmp_seq=(\d+) .*?time=([\d.]+) ms")
 _PING_TOTALS = re.compile(r"(\d+) packets transmitted, (\d+) packets received")
+INTERNET_ANCHOR = "1.1.1.1"  # public host standing in for "the internet"
 
 
 def _route_lookup(*args: str) -> dict:
@@ -349,21 +350,28 @@ def router_address(ifname: str | None) -> str | None:
 
 
 def internet_interface() -> str | None:
-    """Interface carrying the IPv4 default route — a tunnel when a VPN has
-    taken over internet traffic."""
-    return _route_lookup("default").get("interface")
+    """Interface carrying traffic to the internet anchor — a tunnel when a
+    VPN has taken over. Looks up the real destination rather than the default
+    route: VPNs such as wg-quick add 0/1 + 128/1 and leave the default alone."""
+    return _route_lookup(INTERNET_ANCHOR).get("interface")
 
 
 def parse_ping(output: str) -> list[float | None] | None:
-    """One entry per ping sent: RTT in ms, or None if lost. None overall
-    when the output has no statistics (ping didn't run)."""
+    """RTT in ms per sequence number, or None if lost. None overall when the
+    output has no statistics (ping didn't run).
+
+    Sends after the last reply are dropped: an interrupted ping may still
+    have them in flight (measured: 11 sent, 10 received, nothing lost).
+    """
     totals = _PING_TOTALS.search(output)
     if not totals:
         return None
-    sent, received = int(totals.group(1)), int(totals.group(2))
-    rtts: list[float | None] = [float(ms) for ms in _PING_RTT.findall(output)]
-    rtts = rtts[:received]  # drop (DUP!) replies
-    return rtts + [None] * (sent - len(rtts))
+    replies = {}
+    for seq, ms in _PING_REPLY.findall(output):
+        replies.setdefault(int(seq), float(ms))  # ignore (DUP!) replies
+    if not replies:
+        return [None] * int(totals.group(1))
+    return [replies.get(seq) for seq in range(max(replies) + 1)]
 
 
 def ping_router(router: str, ifname: str) -> list[float | None] | None:
@@ -409,22 +417,25 @@ def probe_loop():
     global _path_router, _path_internet_iface, _path_checked_at
     while True:
         started = time.time()
-        router = router_address(_ifname)
-        internet_iface = internet_interface()
-        samples = None
-        if router:
-            with _radio_lock:
-                samples = ping_router(router, _ifname)
-        with _path_lock:
-            # A new router means a new network; old pings measured another
-            # link. A burst that couldn't run leaves nothing current to show.
-            if router != _path_router or samples is None:
-                _ping_samples.clear()
-            if samples:
-                _ping_samples.extend(samples)
-            _path_router = router
-            _path_internet_iface = internet_iface
-            _path_checked_at = time.time()
+        try:
+            router = router_address(_ifname)
+            internet_iface = internet_interface()
+            samples = None
+            if router:
+                with _radio_lock:
+                    samples = ping_router(router, _ifname)
+            with _path_lock:
+                # A new router means a new network; old pings measured another
+                # link. A burst that couldn't run leaves nothing current to show.
+                if router != _path_router or samples is None:
+                    _ping_samples.clear()
+                if samples:
+                    _ping_samples.extend(samples)
+                _path_router = router
+                _path_internet_iface = internet_iface
+                _path_checked_at = time.time()
+        except Exception:
+            log.exception("path probe failed")
         time.sleep(max(0.0, PROBE_INTERVAL - (time.time() - started)))
 
 
@@ -452,7 +463,8 @@ def is_tunnel(iface: str | None) -> bool:
 # Diagnosis — per-hop latency idle and under load
 # ────────────────────────────────────────────────────────────────────────
 
-DIAGNOSE_ANCHOR = "1.1.1.1"  # public host standing in for "the internet"
+class DiagnosisCancelled(Exception):
+    pass
 
 
 def _first_hop_past(router: str) -> str | None:
@@ -460,7 +472,7 @@ def _first_hop_past(router: str) -> str | None:
     ISP's gateway (or the modem, behind a double NAT)."""
     try:
         out = subprocess.run(
-            ["traceroute", "-n", "-m", "4", "-q", "1", "-w", "1", DIAGNOSE_ANCHOR],
+            ["traceroute", "-n", "-m", "4", "-q", "1", "-w", "1", INTERNET_ANCHOR],
             capture_output=True, text=True, timeout=10,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -472,46 +484,91 @@ def _first_hop_past(router: str) -> str | None:
     return None
 
 
-def _network_quality(direction: str) -> float | None:
+def _network_quality(direction: str) -> tuple[float | None, float]:
     """Throughput in Mbps for one direction ("dl" or "ul") via macOS's
-    networkQuality, which saturates the connection while it runs."""
+    networkQuality, which saturates the connection while it runs, and the
+    peak Wi-Fi transmit rate sampled meanwhile (an idle link reads low)."""
     skip = "-u" if direction == "dl" else "-d"
+    peak_tx = 0.0
     try:
-        out = subprocess.run(
+        proc = subprocess.Popen(
             ["networkQuality", skip, "-c", "-M", "10"],
-            capture_output=True, text=True, timeout=30,
-        ).stdout
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except OSError:
+        return None, peak_tx
+    deadline = time.time() + 30
+    while True:
+        peak_tx = max(peak_tx, poll_wifi().get("txRate") or 0)
+        try:
+            out = proc.communicate(timeout=0.5)[0]
+            break
+        except subprocess.TimeoutExpired:
+            if time.time() > deadline:
+                proc.kill()
+                out = proc.communicate()[0]
+                break
+    try:
         bps = json.loads(out).get(f"{direction}_throughput")
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    return round(bps / 1e6, 1) if bps else None
+    except (ValueError, AttributeError):
+        bps = None
+    return (round(bps / 1e6, 1) if bps else None), peak_tx
 
 
 def _ping_during(targets: dict, action):
     """Ping every target every 0.2 s while action() runs. Returns action's
     result and {name: ping_stats}."""
-    procs = {
-        name: subprocess.Popen(
-            ["ping", "-n", "-i", "0.2", *(["-b", _ifname] if wifi_only else []), ip],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        )
-        for name, (ip, wifi_only) in targets.items()
-    }
+    procs = {}
     try:
+        for name, (ip, wifi_only) in targets.items():
+            procs[name] = subprocess.Popen(
+                ["ping", "-n", "-i", "0.2", *(["-b", _ifname] if wifi_only else []), ip],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
         result = action()
     finally:
         for proc in procs.values():
             proc.send_signal(signal.SIGINT)  # ping prints its totals on SIGINT
+        outputs = {name: proc.communicate()[0] for name, proc in procs.items()}
     return result, {
-        name: ping_stats(parse_ping(proc.communicate()[0]) or [])
-        for name, proc in procs.items()
+        name: ping_stats(parse_ping(out) or []) for name, out in outputs.items()
     }
 
 
-def run_diagnosis(progress) -> dict:
+def _channel_context(link: dict) -> dict:
+    """Other networks sharing the link's spectrum, and the bands the user's
+    own SSID was seen on. None when the scan can't tell."""
+    with _cache_lock:
+        nodes = list(_cached_nodes)
+    ssid, ch, band = link.get("ssid"), link.get("channel"), link.get("band")
+    if not nodes or not ch or ssid in (None, "Unknown"):
+        return {"neighborsOnChannel": None, "ssidBands": None}
+    if band == "2.4GHz":
+        # 20 MHz channels overlap neighbours up to 4 numbers away.
+        def overlaps(c):
+            return abs(c - ch) < 5
+    else:
+        # A wider link spans a width-aligned block of 20 MHz channels (5 MHz
+        # per channel number; blocks start at 36 on 5 GHz, 1 on 6 GHz).
+        span = (link.get("widthMhz") or 20) // 5
+        base = 36 if band == "5GHz" else 1
+
+        def overlaps(c):
+            return (c - base) // span == (ch - base) // span
+    return {
+        "neighborsOnChannel": len({
+            n["bssid"] for n in nodes
+            if n["ssid"] != ssid and n["band"] == band and overlaps(n["channel"])
+        }),
+        "ssidBands": sorted({n["band"] for n in nodes if n["ssid"] == ssid}),
+    }
+
+
+def run_diagnosis(progress, cancel: threading.Event) -> dict:
     """Measure the router, the ISP's first hop, and the internet idle, then
     while networkQuality saturates download and then upload. The hop whose
-    latency rises first under load is where traffic queues. ~30 s."""
+    latency rises first under load is where traffic queues. ~30 s. Raises
+    DiagnosisCancelled at the next phase once `cancel` is set."""
     progress("waiting")
     with _radio_lock:  # pauses scans and the path probe for the whole run
         link = get_current_connection()
@@ -525,29 +582,24 @@ def run_diagnosis(progress) -> dict:
             isp = None if vpn else _first_hop_past(router)
             if isp:
                 targets["isp"] = (isp, False)
-        targets["internet"] = (DIAGNOSE_ANCHOR, False)
+        targets["internet"] = (INTERNET_ANCHOR, False)
 
-        progress("idle")
-        _, idle = _ping_during(targets, lambda: time.sleep(6))
-        progress("download")
-        down_mbps, download = _ping_during(targets, lambda: _network_quality("dl"))
-        progress("upload")
-        up_mbps, upload = _ping_during(targets, lambda: _network_quality("ul"))
+        def measure(stage, action):
+            if cancel.is_set():
+                raise DiagnosisCancelled
+            progress(stage)
+            return _ping_during(targets, action)
 
-    with _cache_lock:
-        nodes = list(_cached_nodes)
-    ch, band = link.get("channel"), link.get("band")
-    # 2.4 GHz channels overlap their neighbours up to 4 numbers away.
-    overlaps = (lambda c: abs(c - ch) < 5) if band == "2.4GHz" else (lambda c: c == ch)
-    link["neighborsOnChannel"] = len({
-        n["bssid"] for n in nodes
-        if n["ssid"] != link.get("ssid") and n["band"] == band and overlaps(n["channel"])
-    })
-    link["ssidBands"] = sorted({n["band"] for n in nodes if n["ssid"] == link.get("ssid")})
+        _, idle = measure("idle", lambda: time.sleep(6))
+        (down_mbps, dl_tx), download = measure("download", lambda: _network_quality("dl"))
+        (up_mbps, ul_tx), upload = measure("upload", lambda: _network_quality("ul"))
+        link["txRateUnderLoad"] = max(dl_tx, ul_tx)
 
+    link.update(_channel_context(link))
     return {
         "link": link,
         "vpn": vpn,
+        "wifiInterface": _ifname,
         "internetInterface": internet_iface,
         "hops": [
             {"name": name, "address": ip, "idle": idle[name],
@@ -735,19 +787,26 @@ async def serve_stream(websocket, bus: Broadcaster):
 
 
 async def serve_diagnosis(websocket):
-    """One run per connection: stage updates, then the report. A run that
-    loses its client still finishes; runs queue on the radio lock."""
+    """One run per connection: stage updates, then the report. Closing the
+    socket cancels the run at its next phase; runs queue on the radio lock."""
     loop = asyncio.get_running_loop()
+    cancel = threading.Event()
 
     def progress(stage):
         asyncio.run_coroutine_threadsafe(
             websocket.send(json.dumps({"status": "running", "stage": stage})), loop
         )
 
+    run = asyncio.ensure_future(asyncio.to_thread(run_diagnosis, progress, cancel))
+    closed = asyncio.ensure_future(websocket.wait_closed())
+    await asyncio.wait({run, closed}, return_when=asyncio.FIRST_COMPLETED)
+    if closed.done():
+        cancel.set()
+    closed.cancel()
     try:
-        report = await asyncio.to_thread(run_diagnosis, progress)
+        report = await run
         await websocket.send(json.dumps({"status": "done", "report": report}))
-    except websockets.exceptions.ConnectionClosed:
+    except (DiagnosisCancelled, websockets.exceptions.ConnectionClosed):
         pass
     except Exception as exc:
         log.exception("diagnosis failed")

@@ -67,8 +67,10 @@ configures the UI automatically.
   the last 60 results for the Path panel. The ping is bound to the Wi-Fi
   interface and the router is found from that interface's own default route,
   so a full-tunnel VPN doesn't redirect it to the VPN endpoint. The same
-  thread reads which interface carries the IPv4 default route; a `utun`,
-  `ipsec`, `ppp`, `tun`, or `tap` interface is reported as a VPN.
+  thread looks up which interface carries traffic to 1.1.1.1 (the real route,
+  so VPNs that add `0/1` + `128/1` instead of replacing the default are
+  caught); a `utun`, `ipsec`, `ppp`, `tun`, or `tap` interface is reported as
+  a VPN.
 - Scans and latency measurements share a radio lock. A scan takes the radio
   off channel (router pings measured jumping from ~4 ms to 189 ms, with
   "No route to host" failures), so pings never overlap one, and a diagnosis

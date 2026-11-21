@@ -5,7 +5,7 @@ import "./SurveyView.css";
 import "./DiagnoseView.css";
 
 const STAGES = {
-  waiting: "Waiting for the current Wi-Fi scan to finish…",
+  waiting: "Waiting for other measurements to finish…",
   idle: "Measuring idle latency…",
   download: "Saturating download and measuring latency…",
   upload: "Saturating upload and measuring latency…",

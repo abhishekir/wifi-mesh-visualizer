@@ -1,4 +1,5 @@
 import {
+  PATH_STALE_S,
   TONE_COLORS,
   describeInternetRoute,
   jitterTone,
@@ -22,6 +23,13 @@ export default function PathDiagnostics({ path, styles }) {
       </span>
     </div>
   );
+
+  if (path.checkedAge > PATH_STALE_S) {
+    return row("Path", `No update for ${Math.round(path.checkedAge)} s`, {
+      tone: "unknown",
+      title: "The path probe stopped reporting, so its numbers would be out of date.",
+    });
+  }
 
   const ping = path.ping;
   const route = describeInternetRoute(path);
@@ -63,7 +71,7 @@ export default function PathDiagnostics({ path, styles }) {
         ))}
       {row("Internet", route.label, {
         tone: route.tone,
-        title: "Interface carrying the IPv4 default route.",
+        title: "Interface carrying traffic to the internet (route to 1.1.1.1).",
       })}
       {route.note && <div style={local.note}>{route.note}</div>}
     </>

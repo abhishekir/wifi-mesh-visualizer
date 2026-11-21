@@ -3,7 +3,8 @@
 // quotes the measurements behind it.
 
 export const QUEUE_MS = 30; // latency rise under load that means a queue is filling
-// Idle pings lost beyond the previous hop's; one in ~30 is noise.
+// Pings lost beyond the previous hop's in one phase; a single lost ping isn't
+// enough to blame a hop.
 const MIN_LOST = 2;
 // Real throughput is ~50–65% of the PHY rate, so above this share of the link
 // rate the Wi-Fi link itself is the limit.
@@ -11,6 +12,7 @@ const WIFI_LIMIT_SHARE = 0.45;
 const PHASES = ["download", "upload"];
 
 const ms = (value) => `${Math.round(value)} ms`;
+const when = (phase) => (phase === "idle" ? "while idle" : `during ${phase}`);
 
 function phaseText(hop, phase) {
   const stats = hop[phase];
@@ -23,27 +25,49 @@ export function hopEvidence(hop) {
   return ["idle", ...PHASES].map((phase) => phaseText(hop, phase)).join(", ");
 }
 
-// Largest rise in average latency from idle to a loaded phase, minus the same
-// rise at `base` (the previous hop) so each hop is charged only for its own
-// queue.
+// Latency added by load in one phase; null when either phase had no replies
+// (total loss is judged by lossyPhase, not as a latency drop).
+function riseOf(hop, phase) {
+  const loaded = hop?.[phase]?.avgMs;
+  const idle = hop?.idle?.avgMs;
+  return loaded == null || idle == null ? null : loaded - idle;
+}
+
+// Largest rise from idle to a loaded phase, minus the same rise at `base`
+// (the previous hop) so each hop is charged only for its own queue.
 function worstRise(hop, base) {
   let worst = null;
   for (const phase of PHASES) {
-    const own = hop?.[phase]?.avgMs - hop?.idle?.avgMs;
-    const inherited = base ? base[phase]?.avgMs - base.idle?.avgMs : 0;
-    const rise = own - (Number.isFinite(inherited) ? inherited : 0);
-    if (Number.isFinite(rise) && (!worst || rise > worst.rise)) {
-      worst = { phase, rise };
+    const own = riseOf(hop, phase);
+    const inherited = base ? riseOf(base, phase) : 0;
+    if (own == null || inherited == null) continue;
+    if (!worst || own - inherited > worst.rise) {
+      worst = { phase, rise: own - inherited };
     }
   }
   return worst;
 }
 
-const lostIdle = (hop) =>
-  hop?.idle ? Math.round((hop.idle.lossPct * hop.idle.sent) / 100) : 0;
-const lossy = (hop, base) => lostIdle(hop) - lostIdle(base) >= MIN_LOST;
+const lost = (hop, phase) => {
+  const stats = hop?.[phase];
+  return stats ? Math.round((stats.lossPct * stats.sent) / 100) : 0;
+};
 
-function assessWifi(link, router) {
+// First phase where this hop lost MIN_LOST more pings than the previous hop.
+function lossyPhase(hop, base) {
+  return (
+    ["idle", ...PHASES].find(
+      (phase) => lost(hop, phase) - lost(base, phase) >= MIN_LOST,
+    ) ?? null
+  );
+}
+
+// Internet traffic leaves by another interface (Ethernet, or Wi-Fi is off).
+const offWifi = (report) =>
+  !report.vpn && report.internetInterface !== report.wifiInterface;
+
+function assessWifi(report, router) {
+  const { link } = report;
   const hop = "Wi-Fi link";
   if (!router) {
     return { hop, status: "unknown", summary: "Router not found.", evidence: [] };
@@ -53,10 +77,19 @@ function assessWifi(link, router) {
     `Signal ${link.rssi} dBm, SNR ${link.snr} dB, ${link.band}${width}, link rate ${link.txRate} Mbps`,
     `Router ${router.address}: ${hopEvidence(router)}`,
   ];
+  if (offWifi(report)) {
+    return {
+      hop,
+      status: "unknown",
+      summary: `Internet traffic goes via ${report.internetInterface}, not Wi-Fi, so this run didn't load the Wi-Fi link.`,
+      evidence,
+    };
+  }
   const problems = [];
   if (link.rssi && link.rssi < -70) problems.push(`Weak signal (${link.rssi} dBm)`);
-  if (lossy(router)) {
-    problems.push(`${router.idle.lossPct}% of idle pings to the router were lost`);
+  const lossy = lossyPhase(router);
+  if (lossy) {
+    problems.push(`${router[lossy].lossPct}% of pings to the router were lost ${when(lossy)}`);
   }
   const rise = worstRise(router);
   const congested = rise?.rise > QUEUE_MS;
@@ -67,13 +100,16 @@ function assessWifi(link, router) {
   }
   return problems.length
     ? { hop, status: "problem", summary: `${problems.join(". ")}.`, evidence, congested }
-    : { hop, status: "ok", summary: "Stable latency to the router, idle and under load.", evidence };
+    : { hop, status: "ok", summary: "Stable latency and no loss to the router, idle and under load.", evidence };
 }
 
 function assessUpstream(vpn, router, isp) {
   const hop = "Router to ISP";
   if (vpn) {
     return { hop, status: "unknown", summary: "Not measured while the VPN is on.", evidence: [] };
+  }
+  if (!router) {
+    return { hop, status: "unknown", summary: "Not measured: router not found.", evidence: [] };
   }
   if (!isp) {
     return { hop, status: "unknown", summary: "The ISP's first hop didn't answer.", evidence: [] };
@@ -87,8 +123,9 @@ function assessUpstream(vpn, router, isp) {
       `Latency builds up past the router during ${rise.phase} (+${ms(rise.rise)}): the modem or ISP link is queuing traffic (bufferbloat)`,
     );
   }
-  if (lossy(isp, router)) {
-    problems.push(`Packets are lost past the router (${isp.idle.lossPct}% idle)`);
+  const lossy = lossyPhase(isp, router);
+  if (lossy) {
+    problems.push(`Packets are lost past the router (${isp[lossy].lossPct}% ${when(lossy)})`);
   }
   return problems.length
     ? { hop, status: "problem", summary: `${problems.join(". ")}.`, evidence, bufferbloat }
@@ -104,8 +141,9 @@ function assessInternet(vpn, base, internet) {
   if (rise?.rise > QUEUE_MS) {
     problems.push(`Latency rises a further ${ms(rise.rise)} during ${rise.phase}`);
   }
-  if (lossy(internet, base)) {
-    problems.push(`${internet.idle.lossPct}% of idle pings were lost`);
+  const lossy = lossyPhase(internet, base);
+  if (lossy) {
+    problems.push(`${internet[lossy].lossPct}% of pings were lost ${when(lossy)}`);
   }
   return problems.length
     ? { hop, status: "problem", summary: `${problems.join(". ")}.`, evidence }
@@ -115,25 +153,33 @@ function assessInternet(vpn, base, internet) {
 function assessThroughput(report) {
   const hop = "Speed";
   const { downloadMbps: down, uploadMbps: up, link, vpn } = report;
-  if (down == null) {
+  const tx = link.txRateUnderLoad;
+  if (down == null && up == null) {
     return { hop, status: "unknown", summary: "Speed test didn't complete.", evidence: [] };
   }
   const evidence = [
-    `Download ${down} Mbps, upload ${up ?? "?"} Mbps; Wi-Fi link rate ${link.txRate} Mbps`,
+    `Download ${down ?? "?"} Mbps, upload ${up ?? "?"} Mbps; Wi-Fi link rate under load ${tx || "?"} Mbps`,
   ];
-  const share = link.txRate ? down / link.txRate : 0;
+  if (offWifi(report)) {
+    return { hop, status: "unknown", summary: "Measured off Wi-Fi, so it says nothing about the Wi-Fi link.", evidence };
+  }
+  if (!tx) {
+    return { hop, status: "unknown", summary: "Wi-Fi link rate unknown, so the limit can't be placed.", evidence };
+  }
+  const share = Math.max(down ?? 0, up ?? 0) / tx;
   if (share >= WIFI_LIMIT_SHARE) {
     return {
       hop,
       status: "problem",
-      summary: `Download is ${Math.round(share * 100)}% of the link rate: the Wi-Fi link is the limit.`,
+      // macOS reports only the Mac's transmit rate, not the access point's.
+      summary: `Throughput reaches ${Math.round(share * 100)}% of the Wi-Fi link rate: the Wi-Fi link is likely the limit (estimate).`,
       evidence,
     };
   }
   return {
     hop,
     status: "info",
-    summary: `Download is well under the link rate, so the cap is past your Wi-Fi: ${vpn ? "the VPN or " : ""}your ISP plan.`,
+    summary: `Throughput is well under the Wi-Fi link rate, so the cap is past your Wi-Fi: ${vpn ? "the VPN or " : ""}your ISP plan.`,
     evidence,
   };
 }
@@ -152,9 +198,9 @@ function suggest(report, findings) {
       `Signal is weak here (${link.rssi} dBm). Move closer to the router or add a mesh unit between it and this spot.`,
     );
   }
-  if (link.band === "2.4GHz") {
+  if (link.band === "2.4GHz" && link.ssidBands) {
     tips.push(
-      link.ssidBands?.includes("5GHz")
+      link.ssidBands.includes("5GHz")
         ? "You're on 2.4 GHz although your network also broadcasts 5 GHz, which is usually several times faster. Move closer to the router, or give 5 GHz its own network name and join it."
         : "Only 2.4 GHz is visible for your network here. Turn on 5 GHz in the router if it's off; it's usually several times faster.",
     );
@@ -182,7 +228,7 @@ function suggest(report, findings) {
   }
   if (speed.status === "info" && !vpn) {
     tips.push(
-      `Compare ${down}/${up} Mbps with your ISP plan. If they match, the plan is the limit and only an upgrade will go faster.`,
+      `Compare ${down ?? "?"}/${up ?? "?"} Mbps with your ISP plan. If they match, the plan is the limit and only an upgrade will go faster.`,
     );
   }
   if (internet.status === "problem" && !vpn) {
@@ -197,7 +243,7 @@ export function assessDiagnosis(report) {
   const byName = Object.fromEntries(report.hops.map((hop) => [hop.name, hop]));
   const { router, isp, internet } = byName;
   const findings = [
-    assessWifi(report.link, router),
+    assessWifi(report, router),
     assessUpstream(report.vpn, router, isp),
     assessInternet(report.vpn, isp ?? router, internet),
     assessThroughput(report),
