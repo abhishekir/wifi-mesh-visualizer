@@ -27,7 +27,8 @@ jobs:
       - run: npm run build
 
   backend:
-    runs-on: ubuntu-latest
+    # Pinned: setup-python has no 3.9 build for Ubuntu 26.04 (ubuntu-latest).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

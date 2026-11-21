@@ -1,3 +1,11 @@
+import PathDiagnostics from "./PathDiagnostics";
+import {
+  HIDDEN_BSSIDS_HINT,
+  LINK_RATE_HINT,
+  describeMeshRadios,
+  summarizeMeshNetworks,
+} from "../utils/diagnostics";
+
 const healthColor = {
   Excellent: "#00ff88",
   Good: "#88ff00",
@@ -46,27 +54,16 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
     );
   }
 
-  const { nodes, connection, scanStale, scanAge } = meshData;
+  const { nodes, connection, path, scanStale, scanAge } = meshData;
   const collectorFailed =
     connection != null && Object.hasOwn(connection, "error");
   const linkUp = !collectorFailed && !!connection?.linkUp;
-  const meshNetworks = nodes.filter((n) => n.isMesh);
   const uniqueSSIDs = [...new Set(nodes.map((n) => n.ssid))];
-  const meshSSIDs = [...new Set(meshNetworks.map((n) => n.ssid))];
+  // Per-SSID mesh node breakdown — primary debugging surface.
+  const meshNetworks = summarizeMeshNetworks(nodes);
 
   const connHealth = linkUp ? getHealth(connection.rssi) : "Offline";
   const connColor = healthColor[connHealth];
-
-  // Per-SSID mesh node breakdown — primary debugging surface.
-  const meshBreakdown = {};
-  for (const n of meshNetworks) {
-    if (!meshBreakdown[n.ssid]) {
-      meshBreakdown[n.ssid] = { bssids: new Set(), channels: new Set(), bands: new Set() };
-    }
-    meshBreakdown[n.ssid].bssids.add(n.bssid);
-    meshBreakdown[n.ssid].channels.add(n.channel);
-    meshBreakdown[n.ssid].bands.add(n.band);
-  }
 
   return (
     <div style={styles.container}>
@@ -121,9 +118,12 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
               <span style={styles.label}>SNR</span>
               <span style={styles.value}>{connection.snr} dB</span>
             </div>
-            <div style={styles.row}>
-              <span style={styles.label}>Tx Rate</span>
-              <span style={styles.value}>{connection.txRate} Mbps</span>
+            <div style={styles.row} title={LINK_RATE_HINT}>
+              <span style={styles.label}>Link rate</span>
+              <span style={styles.value}>
+                {connection.txRate} Mbps
+                <span style={styles.bandTag}>not throughput</span>
+              </span>
             </div>
             <div style={styles.healthBadge}>
               <span
@@ -142,6 +142,14 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
           <div style={styles.offline}>No active Wi-Fi link</div>
         )}
       </div>
+
+      {/* Router latency/loss and whether a VPN carries internet traffic */}
+      {path && (
+        <div style={styles.section}>
+          <div style={styles.sectionTitle}>Path</div>
+          <PathDiagnostics path={path} styles={styles} />
+        </div>
+      )}
 
       {/* Scan summary */}
       <div style={styles.section}>
@@ -165,23 +173,28 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
       </div>
 
       {/* Mesh detail — the debugging primary surface */}
-      {meshSSIDs.length > 0 && (
+      {meshNetworks.length > 0 && (
         <div style={styles.section}>
           <div style={styles.sectionTitle}>Mesh Topology</div>
-          {meshSSIDs.map((ssid) => {
-            const info = meshBreakdown[ssid];
-            const isCurrent = linkUp && connection.ssid === ssid;
+          {meshNetworks.some((info) => info.bssidsHidden) && (
+            <div style={styles.meshWarn} title={HIDDEN_BSSIDS_HINT}>
+              Unit counts unknown: macOS hid BSSIDs
+            </div>
+          )}
+          {meshNetworks.map((info) => {
+            const isCurrent = linkUp && connection.ssid === info.ssid;
+            const radios = describeMeshRadios(info);
             return (
-              <div key={ssid} style={{
+              <div key={info.ssid} title={radios.title} style={{
                 ...styles.meshRow,
                 borderLeft: isCurrent ? "2px solid #4488ff" : "2px solid transparent",
                 paddingLeft: 6,
               }}>
-                <div style={styles.meshSsid}>{ssid}</div>
-                <div style={styles.meshMeta}>
-                  {info.bssids.size} radios · {info.channels.size} channels ·{" "}
-                  {[...info.bands].sort().join("/")}
-                </div>
+                <div style={styles.meshSsid}>{info.ssid}</div>
+                <div style={styles.meshMeta}>{radios.primary}</div>
+                {radios.secondary && (
+                  <div style={styles.meshMeta}>{radios.secondary}</div>
+                )}
               </div>
             );
           })}
@@ -350,6 +363,11 @@ const styles = {
     color: "#667",
     fontSize: 10,
     marginTop: 1,
+  },
+  meshWarn: {
+    color: "#ffaa00",
+    fontSize: 10,
+    marginBottom: 6,
   },
   nodeList: { marginTop: 4 },
   nodeRow: {
