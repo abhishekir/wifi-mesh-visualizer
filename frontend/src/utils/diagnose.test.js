@@ -204,6 +204,73 @@ describe("assessDiagnosis", () => {
   });
 });
 
+describe("follow-up review (P2)", () => {
+  const noReplies = { sent: 50, lossPct: 100, avgMs: null };
+
+  it("blames Wi-Fi, not the ISP, when throughput is low and the link is congested", () => {
+    const report = withHop(
+      { ...uploadBloatAtHome, downloadMbps: 100 },
+      hop("router", "192.168.86.1", [5], [200], [9]),
+    );
+    const speed = byHop(assessDiagnosis(report))["Speed"];
+    expect(speed.status).toBe("problem");
+    expect(speed.summary).toMatch(/only 12% .*congested under load/);
+    expect(tips(report)).not.toMatch(/ISP plan/);
+  });
+
+  it("keeps the speed verdict inconclusive when the Wi-Fi verdict isn't ok", () => {
+    const report = withHop(uploadBloatAtHome, hop("router", "192.168.86.1", [5, 8], [8], [9]));
+    expect(byHop(assessDiagnosis(report))["Speed"].status).toBe("unknown");
+  });
+
+  it("returns unknown, not ok, for a phase without ping statistics", () => {
+    const missing = (name) => {
+      const original = uploadBloatAtHome.hops.find((h) => h.name === name);
+      return { ...original, download: null };
+    };
+    const f = (name) => byHop(assessDiagnosis(withHop(uploadBloatAtHome, missing(name))));
+    expect(f("router")["Wi-Fi link"].status).toBe("unknown");
+    expect(f("isp")["Router to ISP"].status).toBe("unknown");
+    expect(f("internet")["Internet past your ISP"]).toMatchObject({
+      status: "unknown",
+      evidence: [expect.stringMatching(/download not measured/)],
+    });
+  });
+
+  it("doesn't call ignored pings at the ISP hop forwarding loss", () => {
+    const report = withHop(uploadBloatAtHome, {
+      name: "isp", address: "73.158.238.1", idle: noReplies, download: noReplies, upload: noReplies,
+    });
+    const f = byHop(assessDiagnosis(report));
+    expect(f["Router to ISP"].status).toBe("ok");
+    expect(f["Router to ISP"].summary).toMatch(/rate-limiting ping/);
+    // The ISP hop can't be a baseline, so the internet verdict covers past the router.
+    expect(f["Internet past your router"]).toBeDefined();
+  });
+
+  it("can't confirm ISP-hop loss without an internet measurement", () => {
+    const report = {
+      ...uploadBloatAtHome,
+      hops: [
+        uploadBloatAtHome.hops[0],
+        hop("isp", "73.158.238.1", [12, 20], [20], [21]),
+      ],
+    };
+    expect(byHop(assessDiagnosis(report))["Router to ISP"].status).toBe("unknown");
+  });
+
+  it("scopes the internet verdict to past the router when there's no ISP hop", () => {
+    const report = {
+      ...uploadBloatAtHome,
+      hops: [uploadBloatAtHome.hops[0], hop("internet", "1.1.1.1", [24], [33], [714])],
+    };
+    const f = byHop(assessDiagnosis(report));
+    expect(f["Internet past your router"].status).toBe("problem");
+    expect(tips(report)).toMatch(/starts past your router \(the modem/);
+    expect(tips(report)).not.toMatch(/ISP's first hop/);
+  });
+});
+
 describe("hopEvidence", () => {
   it("lists each phase with loss only when present", () => {
     expect(hopEvidence(congestedWifiOverVpn.hops[0])).toBe(

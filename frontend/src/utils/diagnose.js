@@ -16,13 +16,14 @@ const when = (phase) => (phase === "idle" ? "while idle" : `during ${phase}`);
 
 function phaseText(hop, phase) {
   const stats = hop[phase];
-  if (stats?.avgMs == null) return `${phase} no replies`;
+  if (!stats) return `${phase} not measured`;
+  if (stats.avgMs == null) return `${phase} no replies`;
   const loss = stats.lossPct > 0 ? ` (${stats.lossPct}% loss)` : "";
   return `${phase} ${ms(stats.avgMs)}${loss}`;
 }
 
 export function hopEvidence(hop) {
-  return ["idle", ...PHASES].map((phase) => phaseText(hop, phase)).join(", ");
+  return ALL_PHASES.map((phase) => phaseText(hop, phase)).join(", ");
 }
 
 // Latency added by load in one phase; null when either phase had no replies
@@ -53,10 +54,16 @@ const lost = (hop, phase) => {
   return stats ? Math.round((stats.lossPct * stats.sent) / 100) : 0;
 };
 
+const ALL_PHASES = ["idle", ...PHASES];
+// Every phase has ping statistics (a ping that failed to run has none).
+const measured = (hop) => ALL_PHASES.every((phase) => hop?.[phase]?.sent > 0);
+// Every phase got replies, so the hop's latency can be a baseline.
+const answered = (hop) => ALL_PHASES.every((phase) => hop?.[phase]?.avgMs != null);
+
 // First phase where this hop lost MIN_LOST more pings than the previous hop.
 function lossyPhase(hop, base) {
   return (
-    ["idle", ...PHASES].find(
+    ALL_PHASES.find(
       (phase) => lost(hop, phase) - lost(base, phase) >= MIN_LOST,
     ) ?? null
   );
@@ -87,6 +94,9 @@ function assessWifi(report, router) {
       evidence,
     };
   }
+  if (!measured(router)) {
+    return { hop, status: "unknown", summary: "Pinging the router failed in at least one phase.", evidence };
+  }
   const problems = [];
   if (link.rssi && link.rssi < -70) problems.push(`Weak signal (${link.rssi} dBm)`);
   const lossy = lossyPhase(router);
@@ -105,7 +115,7 @@ function assessWifi(report, router) {
     : { hop, status: "ok", summary: "Stable latency and no loss to the router, idle and under load.", evidence };
 }
 
-function assessUpstream(vpn, router, isp) {
+function assessUpstream(vpn, router, isp, internet) {
   const hop = "Router to ISP";
   if (vpn) {
     return { hop, status: "unknown", summary: "Not measured while the VPN is on.", evidence: [] };
@@ -117,6 +127,9 @@ function assessUpstream(vpn, router, isp) {
     return { hop, status: "unknown", summary: "The ISP's first hop didn't answer.", evidence: [] };
   }
   const evidence = [`First hop past the router ${isp.address}: ${hopEvidence(isp)}`];
+  if (!measured(isp) || !measured(router)) {
+    return { hop, status: "unknown", summary: "Pinging the ISP's first hop or the router failed in at least one phase.", evidence };
+  }
   const problems = [];
   const rise = worstRise(isp, router);
   const bufferbloat = rise?.rise > QUEUE_MS;
@@ -125,19 +138,37 @@ function assessUpstream(vpn, router, isp) {
       `Latency builds up past the router during ${rise.phase} (+${ms(rise.rise)}): the modem or ISP link is queuing traffic (bufferbloat)`,
     );
   }
+  // Routers often rate-limit pings to themselves while forwarding fine, so
+  // loss here counts only if pings past it are lost too.
   const lossy = lossyPhase(isp, router);
-  if (lossy) {
-    problems.push(`Packets are lost past the router (${isp[lossy].lossPct}% ${when(lossy)})`);
+  const loss = lossy && `${isp[lossy].lossPct}% ${when(lossy)}`;
+  if (lossy && lost(internet, lossy) - lost(router, lossy) >= MIN_LOST) {
+    problems.push(`Packets are lost past the router (${loss})`);
   }
-  return problems.length
-    ? { hop, status: "problem", summary: `${problems.join(". ")}.`, evidence, bufferbloat }
-    : { hop, status: "ok", summary: "No extra latency or loss past the router.", evidence };
+  if (problems.length) {
+    return { hop, status: "problem", summary: `${problems.join(". ")}.`, evidence, bufferbloat };
+  }
+  if (lossy && !measured(internet)) {
+    return {
+      hop,
+      status: "unknown",
+      summary: `The ISP's first hop didn't answer ${loss}, and the internet wasn't measured, so forwarding loss can't be confirmed.`,
+      evidence,
+    };
+  }
+  const summary = lossy
+    ? `No extra latency past the router. The ISP's first hop didn't answer ${loss}, but pings past it got through, so it's likely rate-limiting ping, not dropping traffic.`
+    : "No extra latency or loss past the router.";
+  return { hop, status: "ok", summary, evidence };
 }
 
-function assessInternet(vpn, base, internet) {
-  const hop = vpn ? "Internet (through VPN)" : "Internet past your ISP";
+function assessInternet(vpn, base, internet, pastIsp) {
+  const hop = vpn ? "Internet (through VPN)" : `Internet past your ${pastIsp ? "ISP" : "router"}`;
   if (!internet) return { hop, status: "unknown", summary: "Not measured.", evidence: [] };
   const evidence = [`${internet.address}: ${hopEvidence(internet)}`];
+  if (!measured(internet) || (base && !measured(base))) {
+    return { hop, status: "unknown", summary: "Pinging it failed in at least one phase.", evidence };
+  }
   const problems = [];
   const rise = worstRise(internet, base);
   if (rise?.rise > QUEUE_MS) {
@@ -152,7 +183,7 @@ function assessInternet(vpn, base, internet) {
     : { hop, status: "ok", summary: "No extra latency or loss.", evidence };
 }
 
-function assessThroughput(report) {
+function assessThroughput(report, wifi) {
   const hop = "Speed";
   const { downloadMbps: down, uploadMbps: up, link, vpn } = report;
   const tx = link.txRateUnderLoad;
@@ -178,10 +209,29 @@ function assessThroughput(report) {
       evidence,
     };
   }
+  const pct = `${Math.round(share * 100)}%`;
+  // Contention, retries and mesh backhaul also keep throughput low, so a low
+  // share places the cap upstream only when the Wi-Fi hop held up under load.
+  if (wifi.congested) {
+    return {
+      hop,
+      status: "problem",
+      summary: `Throughput is only ${pct} of the Wi-Fi link rate, but the Wi-Fi link is congested under load: contention or retries on Wi-Fi are the likely limit.`,
+      evidence,
+    };
+  }
+  if (wifi.status !== "ok") {
+    return {
+      hop,
+      status: "unknown",
+      summary: `Throughput is ${pct} of the Wi-Fi link rate, but the Wi-Fi verdict is ${wifi.status === "problem" ? "a problem" : "unknown"}, so the limit can't be placed.`,
+      evidence,
+    };
+  }
   return {
     hop,
     status: "info",
-    summary: `Throughput is well under the Wi-Fi link rate, so the cap is past your Wi-Fi: ${vpn ? "the VPN or " : ""}your ISP plan.`,
+    summary: `Throughput is ${pct} of the Wi-Fi link rate and the Wi-Fi link held up under load, so the cap is likely past your Wi-Fi: ${vpn ? "the VPN or " : ""}your ISP plan (estimate).`,
     evidence,
   };
 }
@@ -234,8 +284,11 @@ function suggest(report, findings) {
     );
   }
   if (internet.status === "problem" && !vpn) {
+    const start = internet.pastIsp
+      ? "past your ISP's first hop"
+      : "past your router (the modem, the ISP's access link, or beyond)";
     tips.push(
-      "Latency or loss starts past your ISP's first hop. If it keeps happening, report it to the ISP with these numbers.",
+      `Latency or loss starts ${start}. If it keeps happening, report it to the ISP with these numbers.`,
     );
   }
   return tips;
@@ -244,11 +297,14 @@ function suggest(report, findings) {
 export function assessDiagnosis(report) {
   const byName = Object.fromEntries(report.hops.map((hop) => [hop.name, hop]));
   const { router, isp, internet } = byName;
+  // The ISP hop is the baseline only if it answered in every phase.
+  const pastIsp = answered(isp);
+  const wifi = assessWifi(report, router);
   const findings = [
-    assessWifi(report, router),
-    assessUpstream(report.vpn, router, isp),
-    assessInternet(report.vpn, isp ?? router, internet),
-    assessThroughput(report),
+    wifi,
+    assessUpstream(report.vpn, router, isp, internet),
+    { ...assessInternet(report.vpn, pastIsp ? isp : router, internet, pastIsp), pastIsp },
+    assessThroughput(report, wifi),
   ];
   return { findings, suggestions: suggest(report, findings) };
 }
