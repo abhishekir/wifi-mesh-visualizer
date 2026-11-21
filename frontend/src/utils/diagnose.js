@@ -64,7 +64,9 @@ function lossyPhase(hop, base) {
 
 // Internet traffic leaves by another interface (Ethernet, or Wi-Fi is off).
 const offWifi = (report) =>
-  !report.vpn && report.internetInterface !== report.wifiInterface;
+  !report.vpn &&
+  Boolean(report.internetInterface) &&
+  report.internetInterface !== report.wifiInterface;
 
 function assessWifi(report, router) {
   const { link } = report;

@@ -356,22 +356,27 @@ def internet_interface() -> str | None:
     return _route_lookup(INTERNET_ANCHOR).get("interface")
 
 
-def parse_ping(output: str) -> list[float | None] | None:
+def parse_ping(output: str, interrupted_every: float | None = None) -> list[float | None] | None:
     """RTT in ms per sequence number, or None if lost. None overall when the
     output has no statistics (ping didn't run).
 
-    Sends after the last reply are dropped: an interrupted ping may still
-    have them in flight (measured: 11 sent, 10 received, nothing lost).
+    For a ping stopped by SIGINT that sent every `interrupted_every` seconds,
+    the last unanswered sends that could still have been in flight are
+    dropped (measured: 11 sent, 10 received, nothing lost). Earlier unanswered
+    sends still count as lost.
     """
     totals = _PING_TOTALS.search(output)
     if not totals:
         return None
+    sent = int(totals.group(1))
     replies = {}
     for seq, ms in _PING_REPLY.findall(output):
         replies.setdefault(int(seq), float(ms))  # ignore (DUP!) replies
-    if not replies:
-        return [None] * int(totals.group(1))
-    return [replies.get(seq) for seq in range(max(replies) + 1)]
+    samples = [replies.get(seq) for seq in range(sent)]
+    if interrupted_every and replies:
+        in_flight = math.ceil(max(replies.values()) / 1000 / interrupted_every) + 1
+        samples = samples[:max(max(replies) + 1, sent - in_flight)]
+    return samples
 
 
 def ping_router(router: str, ifname: str) -> list[float | None] | None:
@@ -531,7 +536,8 @@ def _ping_during(targets: dict, action):
             proc.send_signal(signal.SIGINT)  # ping prints its totals on SIGINT
         outputs = {name: proc.communicate()[0] for name, proc in procs.items()}
     return result, {
-        name: ping_stats(parse_ping(out) or []) for name, out in outputs.items()
+        name: ping_stats(parse_ping(out, interrupted_every=0.2) or [])
+        for name, out in outputs.items()
     }
 
 

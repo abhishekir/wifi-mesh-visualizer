@@ -148,6 +148,14 @@ describe("assessDiagnosis", () => {
     expect(tips(report)).not.toMatch(/ISP plan/);
   });
 
+  // R16
+  it("still judges Wi-Fi when there's no internet route", () => {
+    const report = { ...uploadBloatAtHome, internetInterface: null };
+    const wifi = byHop(assessDiagnosis(report))["Wi-Fi link"];
+    expect(wifi.status).toBe("ok");
+    expect(wifi.summary).not.toMatch(/null/);
+  });
+
   // R5
   it("compares throughput with the link rate measured under load", () => {
     // Idle link rate read 144 Mbps, but the link ran at 400 under load.
