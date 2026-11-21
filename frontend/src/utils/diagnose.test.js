@@ -248,6 +248,20 @@ describe("follow-up review (P2)", () => {
     expect(f["Internet past your router"]).toBeDefined();
   });
 
+  it("finds corroborated loss in a later phase than ISP-only loss", () => {
+    const report = {
+      ...uploadBloatAtHome,
+      hops: [
+        hop("router", "192.168.86.1", [5], [8], [9]),
+        hop("isp", "73.158.238.1", [12, 20], [20], [21, 20]),
+        hop("internet", "1.1.1.1", [24], [33], [34, 20]),
+      ],
+    };
+    const upstream = byHop(assessDiagnosis(report))["Router to ISP"];
+    expect(upstream.status).toBe("problem");
+    expect(upstream.summary).toMatch(/lost past the router \(20% during upload\)/);
+  });
+
   it("can't confirm ISP-hop loss without an internet measurement", () => {
     const report = {
       ...uploadBloatAtHome,

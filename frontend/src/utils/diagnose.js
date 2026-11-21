@@ -139,11 +139,15 @@ function assessUpstream(vpn, router, isp, internet) {
     );
   }
   // Routers often rate-limit pings to themselves while forwarding fine, so
-  // loss here counts only if pings past it are lost too.
+  // loss here counts only in a phase where pings past it are lost too.
   const lossy = lossyPhase(isp, router);
   const loss = lossy && `${isp[lossy].lossPct}% ${when(lossy)}`;
-  if (lossy && lost(internet, lossy) - lost(router, lossy) >= MIN_LOST) {
-    problems.push(`Packets are lost past the router (${loss})`);
+  const losesPastRouter = (target, phase) => lost(target, phase) - lost(router, phase) >= MIN_LOST;
+  const dropped = ALL_PHASES.find(
+    (phase) => losesPastRouter(isp, phase) && losesPastRouter(internet, phase),
+  );
+  if (dropped) {
+    problems.push(`Packets are lost past the router (${isp[dropped].lossPct}% ${when(dropped)})`);
   }
   if (problems.length) {
     return { hop, status: "problem", summary: `${problems.join(". ")}.`, evidence, bufferbloat };
