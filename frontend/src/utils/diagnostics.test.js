@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   describeInternetRoute,
   describeMeshRadios,
+  formatThroughput,
   jitterTone,
   latencyTone,
   lossTone,
@@ -113,5 +114,16 @@ describe("mesh radios", () => {
       node("home", "bb", 36, "5GHz"),
     ]);
     expect(describeMeshRadios(summary).primary).toBe("2 radios · 1 channel");
+  });
+});
+
+describe("formatThroughput", () => {
+  it("shows both directions with one decimal", () => {
+    expect(formatThroughput({ downMbps: 100, upMbps: 3.1 })).toBe("↓ 100.0 ↑ 3.1 Mbps");
+  });
+
+  it("tells warming up apart from an older server without the field", () => {
+    expect(formatThroughput(null)).toBe("Measuring…");
+    expect(formatThroughput(undefined)).toBe("Unavailable");
   });
 });

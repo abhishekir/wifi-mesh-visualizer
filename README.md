@@ -18,6 +18,10 @@ debugging roaming, signal hand-offs, and dead spots.
 - **Path panel** (Terrain and Mesh views) — latency, jitter, and packet loss
   from this Mac to the Wi-Fi router, plus whether internet traffic is going
   through a VPN. Use it to tell a weak Wi-Fi hop apart from a slow ISP or VPN.
+- **Throughput** (Terrain and Mesh views) — Mbps this Mac is actually moving
+  over Wi-Fi each second, from the interface's byte counters, next to the
+  link rate. It shows current usage, not capacity; Diagnose measures the most
+  the connection can reach.
 - **Diagnose view** — a ~30-second run that pings the router, the ISP's first
   hop (via traceroute), and 1.1.1.1 while idle and while macOS's
   `networkQuality` saturates download, then upload. Each hop is charged only
@@ -166,6 +170,10 @@ only in the browser's local storage.
 7. **Path panel** — if router latency and loss look good but speed tests are
    slow, the bottleneck is past your Wi-Fi: the ISP plan, or the VPN when the
    panel shows one. **Link rate** is the radio's negotiated rate, not
-   throughput; expect roughly half to two-thirds of it in practice. Some
+   throughput; expect roughly half to two-thirds of it in practice.
+   **Throughput** far below that during a slow download doesn't rule out
+   Wi-Fi: a busy channel, interference, or retransmissions cut delivered data
+   without lowering the link rate. The bottleneck may be upstream, but run
+   Diagnose (or a test against a wired machine on your LAN) to tell. Some
    routers ignore ping, so 100% loss with a strong signal usually means that
    rather than a dead link.

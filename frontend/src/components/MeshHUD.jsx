@@ -2,7 +2,9 @@ import PathDiagnostics from "./PathDiagnostics";
 import {
   HIDDEN_BSSIDS_HINT,
   LINK_RATE_HINT,
+  THROUGHPUT_HINT,
   describeMeshRadios,
+  formatThroughput,
   summarizeMeshNetworks,
 } from "../utils/diagnostics";
 
@@ -120,9 +122,12 @@ export default function MeshHUD({ meshData, connected, roamEvents = [] }) {
             </div>
             <div style={styles.row} title={LINK_RATE_HINT}>
               <span style={styles.label}>Link rate</span>
+              <span style={styles.value}>{connection.txRate} Mbps</span>
+            </div>
+            <div style={styles.row} title={THROUGHPUT_HINT}>
+              <span style={styles.label}>Throughput</span>
               <span style={styles.value}>
-                {connection.txRate} Mbps
-                <span style={styles.bandTag}>not throughput</span>
+                {formatThroughput(meshData.throughput)}
               </span>
             </div>
             <div style={styles.healthBadge}>
