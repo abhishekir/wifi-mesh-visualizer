@@ -170,8 +170,10 @@ only in the browser's local storage.
 7. **Path panel** — if router latency and loss look good but speed tests are
    slow, the bottleneck is past your Wi-Fi: the ISP plan, or the VPN when the
    panel shows one. **Link rate** is the radio's negotiated rate, not
-   throughput; expect roughly half to two-thirds of it in practice. Watch
-   **Throughput** during a slow download: far below that while the link rate
-   stays high means the bottleneck is past your Wi-Fi. Some
+   throughput; expect roughly half to two-thirds of it in practice.
+   **Throughput** far below that during a slow download doesn't rule out
+   Wi-Fi: a busy channel, interference, or retransmissions cut delivered data
+   without lowering the link rate. The bottleneck may be upstream, but run
+   Diagnose (or a test against a wired machine on your LAN) to tell. Some
    routers ignore ping, so 100% loss with a strong signal usually means that
    rather than a dead link.

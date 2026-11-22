@@ -50,6 +50,7 @@ class WifiThroughputTest(unittest.TestCase):
         stdout = NETSTAT.format(rx=rx, tx=tx) if stdout is None else stdout
         self.run = mock.Mock(return_value=mock.Mock(stdout=stdout))
         with mock.patch.object(server.subprocess, "run", self.run), \
+                mock.patch.object(server, "_ifname", "en0"), \
                 mock.patch.object(server.time, "monotonic", return_value=at):
             return server.wifi_throughput()
 
