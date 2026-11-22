@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   describeInternetRoute,
   describeMeshRadios,
+  formatThroughput,
   jitterTone,
   latencyTone,
   lossTone,
@@ -113,5 +114,12 @@ describe("mesh radios", () => {
       node("home", "bb", 36, "5GHz"),
     ]);
     expect(describeMeshRadios(summary).primary).toBe("2 radios · 1 channel");
+  });
+});
+
+describe("formatThroughput", () => {
+  it("shows both directions, or a placeholder before the first rate", () => {
+    expect(formatThroughput({ downMbps: 42.5, upMbps: 3.1 })).toBe("↓ 42.5  ↑ 3.1 Mbps");
+    expect(formatThroughput(null)).toBe("Measuring…");
   });
 });

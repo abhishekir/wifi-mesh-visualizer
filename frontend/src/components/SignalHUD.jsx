@@ -1,5 +1,9 @@
 import PathDiagnostics from "./PathDiagnostics";
-import { LINK_RATE_HINT } from "../utils/diagnostics";
+import {
+  LINK_RATE_HINT,
+  THROUGHPUT_HINT,
+  formatThroughput,
+} from "../utils/diagnostics";
 
 const healthColor = {
   Excellent: "#00ff88",
@@ -77,10 +81,12 @@ export default function SignalHUD({ data, connected }) {
 
       <div style={styles.row} title={LINK_RATE_HINT}>
         <span style={styles.label}>Link rate</span>
-        <span style={styles.value}>
-          {data.txRate} Mbps
-          <span style={styles.tag}>not throughput</span>
-        </span>
+        <span style={styles.value}>{data.txRate} Mbps</span>
+      </div>
+
+      <div style={styles.row} title={THROUGHPUT_HINT}>
+        <span style={styles.label}>Throughput</span>
+        <span style={styles.value}>{formatThroughput(data.throughput)}</span>
       </div>
 
       <div style={styles.row}>
@@ -145,12 +151,6 @@ const styles = {
   value: {
     fontWeight: 600,
     color: "#e0e0e0",
-  },
-  tag: {
-    fontSize: 10,
-    color: "#667",
-    marginLeft: 6,
-    fontWeight: 400,
   },
   pathSection: {
     marginTop: 12,

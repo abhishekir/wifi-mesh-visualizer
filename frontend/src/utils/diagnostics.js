@@ -13,6 +13,15 @@ export const LINK_RATE_HINT =
   "Real throughput is usually about half to two-thirds of it, and lower " +
   "when other devices share the channel.";
 
+export const THROUGHPUT_HINT =
+  "Data this Mac is moving over Wi-Fi right now, all apps combined, over " +
+  "the last second. It only climbs as high as what you're doing; run " +
+  "Diagnose to see the most your connection can reach.";
+
+export function formatThroughput(t) {
+  return t ? `↓ ${t.downMbps}  ↑ ${t.upMbps} Mbps` : "Measuring…";
+}
+
 // Probes run every 5 s but can wait ~14 s behind a scan; past this the probe
 // has stopped and its numbers are out of date.
 export const PATH_STALE_S = 45;

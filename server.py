@@ -84,6 +84,12 @@ _path_router: str | None = None
 _path_internet_iface: str | None = None
 _path_checked_at: float = 0.0
 
+# ── Throughput state ────────────────────────────────────────────────────
+THROUGHPUT_INTERVAL = 1.0    # seconds between Wi-Fi byte-counter samples
+_throughput_lock = threading.Lock()
+_throughput_sample: tuple[float, int, int] | None = None  # (monotonic, in, out)
+_throughput: dict | None = None
+
 
 # ────────────────────────────────────────────────────────────────────────
 # CoreWLAN polling
@@ -460,6 +466,46 @@ def path_snapshot() -> dict:
     }
 
 
+def parse_netstat_bytes(output: str) -> tuple[int, int] | None:
+    """(bytes in, bytes out) from `netstat -ibn -I <iface>`'s link row."""
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 10 and parts[2].startswith("<Link#"):
+            return int(parts[6]), int(parts[9])
+    return None
+
+
+def wifi_throughput() -> dict | None:
+    """Mbps the Wi-Fi interface actually moved over the last ~second, all
+    traffic combined. Samples at most once per THROUGHPUT_INTERVAL however
+    many streams ask. None until two samples close enough together exist."""
+    global _throughput_sample, _throughput
+    with _throughput_lock:
+        now = time.monotonic()
+        if _throughput_sample and now - _throughput_sample[0] < THROUGHPUT_INTERVAL:
+            return _throughput
+        try:
+            counts = parse_netstat_bytes(subprocess.run(
+                ["netstat", "-ibn", "-I", _ifname or ""],
+                capture_output=True, text=True, timeout=2,
+            ).stdout)
+        except (OSError, subprocess.SubprocessError):
+            counts = None
+        _throughput = None
+        if counts and _throughput_sample:
+            then, rx, tx = _throughput_sample
+            dt = now - then
+            # A long gap (no viewers) would average over it; a counter going
+            # backwards means the interface reset.
+            if dt <= 3 * THROUGHPUT_INTERVAL and counts[0] >= rx and counts[1] >= tx:
+                _throughput = {
+                    "downMbps": round((counts[0] - rx) * 8 / dt / 1e6, 1),
+                    "upMbps": round((counts[1] - tx) * 8 / dt / 1e6, 1),
+                }
+        _throughput_sample = (now, *counts) if counts else None
+        return _throughput
+
+
 def is_tunnel(iface: str | None) -> bool:
     return bool(iface and iface.startswith(_TUNNEL_PREFIXES))
 
@@ -694,7 +740,11 @@ def inject_live_rssi(nodes: list[dict], connection: dict) -> list[dict]:
 
 
 def _build_terrain_payload() -> dict:
-    return {**get_current_connection(), "path": path_snapshot()}
+    return {
+        **get_current_connection(),
+        "path": path_snapshot(),
+        "throughput": wifi_throughput(),
+    }
 
 
 def _build_mesh_payload() -> dict:
@@ -707,6 +757,7 @@ def _build_mesh_payload() -> dict:
         "nodes": nodes,
         "connection": connection,
         "path": path_snapshot(),
+        "throughput": wifi_throughput(),
         "meshHz": MESH_HZ,
         "scanAge": (time.time() - cached_at) if cached_at else None,
         "scanStale": cached_at == 0.0,

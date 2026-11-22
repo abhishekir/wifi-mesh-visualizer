@@ -41,7 +41,9 @@ export default function DiagnoseView() {
       finished = true;
       setStage(null);
       if (msg.status === "done") setReport(msg.report);
-      else setError(`Diagnosis failed: ${msg.error}`);
+      else if (msg.status === "error") setError(`Diagnosis failed: ${msg.error}`);
+      // A server older than this page streams terrain frames for /diagnose.
+      else setError("This server doesn't support diagnosis. Restart server.py.");
       ws.close();
     };
     ws.onclose = () => {
