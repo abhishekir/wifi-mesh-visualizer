@@ -24,7 +24,7 @@ export function formatThroughput(t) {
   if (t === null) return "Measuring…";
   // Fixed decimals and an em space (which HTML doesn't collapse) keep the
   // row's width steady as values change each second.
-  return `↓ ${t.downMbps.toFixed(1)} ↑ ${t.upMbps.toFixed(1)} Mbps`;
+  return `↓ ${t.downMbps.toFixed(1)}\u2003↑ ${t.upMbps.toFixed(1)} Mbps`;
 }
 
 // Probes run every 5 s but can wait ~14 s behind a scan; past this the probe
