@@ -118,8 +118,12 @@ describe("mesh radios", () => {
 });
 
 describe("formatThroughput", () => {
-  it("shows both directions, or a placeholder before the first rate", () => {
-    expect(formatThroughput({ downMbps: 42.5, upMbps: 3.1 })).toBe("↓ 42.5  ↑ 3.1 Mbps");
+  it("shows both directions with one decimal", () => {
+    expect(formatThroughput({ downMbps: 100, upMbps: 3.1 })).toBe("↓ 100.0 ↑ 3.1 Mbps");
+  });
+
+  it("tells warming up apart from an older server without the field", () => {
     expect(formatThroughput(null)).toBe("Measuring…");
+    expect(formatThroughput(undefined)).toBe("Unavailable");
   });
 });

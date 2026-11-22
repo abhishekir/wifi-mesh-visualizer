@@ -18,8 +18,13 @@ export const THROUGHPUT_HINT =
   "the last second. It only climbs as high as what you're doing; run " +
   "Diagnose to see the most your connection can reach.";
 
+// null: no rate yet. undefined: a server older than this page omits the field.
 export function formatThroughput(t) {
-  return t ? `↓ ${t.downMbps}  ↑ ${t.upMbps} Mbps` : "Measuring…";
+  if (t === undefined) return "Unavailable";
+  if (t === null) return "Measuring…";
+  // Fixed decimals and an em space (which HTML doesn't collapse) keep the
+  // row's width steady as values change each second.
+  return `↓ ${t.downMbps.toFixed(1)} ↑ ${t.upMbps.toFixed(1)} Mbps`;
 }
 
 // Probes run every 5 s but can wait ~14 s behind a scan; past this the probe

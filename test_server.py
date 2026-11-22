@@ -46,11 +46,20 @@ class WifiThroughputTest(unittest.TestCase):
     def setUp(self):
         server._throughput_sample = server._throughput = None
 
-    def sample(self, at, rx, tx):
-        run = mock.Mock(return_value=mock.Mock(stdout=NETSTAT.format(rx=rx, tx=tx)))
-        with mock.patch.object(server.subprocess, "run", run), \
+    def sample(self, at, rx, tx, stdout=None):
+        stdout = NETSTAT.format(rx=rx, tx=tx) if stdout is None else stdout
+        self.run = mock.Mock(return_value=mock.Mock(stdout=stdout))
+        with mock.patch.object(server.subprocess, "run", self.run), \
                 mock.patch.object(server.time, "monotonic", return_value=at):
             return server.wifi_throughput()
+
+    def test_failed_sample_stays_rate_limited(self):
+        header_only = NETSTAT.splitlines()[0]  # netstat -I "" exits 0 like this
+        self.assertIsNone(self.sample(100.0, 0, 0, stdout=header_only))
+        self.assertIsNone(self.sample(100.5, 0, 0))
+        self.run.assert_not_called()
+        self.assertIsNone(self.sample(101.0, 0, 0))  # no rate from a failed read
+        self.assertIsNotNone(self.sample(102.0, 1000, 1000))
 
     def test_parses_link_row(self):
         self.assertEqual(server.parse_netstat_bytes(NETSTAT.format(rx=5, tx=7)), (5, 7))

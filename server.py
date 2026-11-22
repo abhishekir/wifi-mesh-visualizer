@@ -87,7 +87,8 @@ _path_checked_at: float = 0.0
 # ── Throughput state ────────────────────────────────────────────────────
 THROUGHPUT_INTERVAL = 1.0    # seconds between Wi-Fi byte-counter samples
 _throughput_lock = threading.Lock()
-_throughput_sample: tuple[float, int, int] | None = None  # (monotonic, in, out)
+# (monotonic, bytes in, bytes out); the counts are None after a failed read.
+_throughput_sample: tuple[float, int | None, int | None] | None = None
 _throughput: dict | None = None
 
 
@@ -478,21 +479,24 @@ def parse_netstat_bytes(output: str) -> tuple[int, int] | None:
 def wifi_throughput() -> dict | None:
     """Mbps the Wi-Fi interface actually moved over the last ~second, all
     traffic combined. Samples at most once per THROUGHPUT_INTERVAL however
-    many streams ask. None until two samples close enough together exist."""
+    many streams ask. None until two samples close enough together exist.
+    A caller arriving mid-sample gets the cached value rather than waiting."""
     global _throughput_sample, _throughput
-    with _throughput_lock:
+    if not _ifname or not _throughput_lock.acquire(blocking=False):
+        return _throughput
+    try:
         now = time.monotonic()
         if _throughput_sample and now - _throughput_sample[0] < THROUGHPUT_INTERVAL:
             return _throughput
         try:
             counts = parse_netstat_bytes(subprocess.run(
-                ["netstat", "-ibn", "-I", _ifname or ""],
+                ["netstat", "-ibn", "-I", _ifname],
                 capture_output=True, text=True, timeout=2,
             ).stdout)
         except (OSError, subprocess.SubprocessError):
             counts = None
         _throughput = None
-        if counts and _throughput_sample:
+        if counts and _throughput_sample and _throughput_sample[1] is not None:
             then, rx, tx = _throughput_sample
             dt = now - then
             # A long gap (no viewers) would average over it; a counter going
@@ -502,8 +506,11 @@ def wifi_throughput() -> dict | None:
                     "downMbps": round((counts[0] - rx) * 8 / dt / 1e6, 1),
                     "upMbps": round((counts[1] - tx) * 8 / dt / 1e6, 1),
                 }
-        _throughput_sample = (now, *counts) if counts else None
+        # Failed attempts are recorded too, so they stay rate-limited.
+        _throughput_sample = (now, *(counts or (None, None)))
         return _throughput
+    finally:
+        _throughput_lock.release()
 
 
 def is_tunnel(iface: str | None) -> bool:
